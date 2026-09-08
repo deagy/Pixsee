@@ -21,8 +21,8 @@ import (
 	"time"
 
 	"virtualdesktop/internal/host"
-	capture_x11 "virtualdesktop/internal/host/capture/x11"
-	"virtualdesktop/internal/host/input/x11"
+	"virtualdesktop/internal/host/capture"
+	"virtualdesktop/internal/host/input"
 	"virtualdesktop/internal/protocol"
 	"virtualdesktop/internal/transport"
 )
@@ -138,21 +138,23 @@ func run(cfg *appConfig) error {
 	defer stop()
 
 	// Wire the platform adapters. The capture adapter reads the desktop; the
-	// input adapter injects keyboard and pointer events. Both are X11-backed for
-	// linux/amd64.
-	cfg.capture = capture_x11.New()
+	// input adapter injects keyboard and pointer events. Both are selected by
+	// build tags behind the neutral capture and input packages, so this wiring
+	// is platform-neutral: linux uses X11, windows uses SendInput, and darwin
+	// uses CoreGraphics.
+	cfg.capture = capture.New()
 
 	var inputErr error
 	var inputOnce sync.Once
 	cfg.input = func() (host.Input, error) {
 		inputOnce.Do(func() {
-			input, err := x11.New()
+			inj, err := input.New()
 			if err != nil {
 				inputErr = err
 				return
 			}
-			defer input.Close()
-			cfg.inputAdapter = input
+			defer inj.Close()
+			cfg.inputAdapter = inj
 		})
 		return cfg.inputAdapter, inputErr
 	}

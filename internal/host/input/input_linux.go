@@ -1,6 +1,10 @@
 //go:build linux
 
-package x11
+// Package input injects keyboard and pointer events on the host. This file is
+// the linux adapter: it sends keyboard and pointer events through X11's XTEST
+// extension. The package is platform neutral; the other files in this package
+// provide the windows and darwin adapters behind the same method set.
+package input
 
 import (
 	"context"
@@ -15,8 +19,6 @@ import (
 	"virtualdesktop/internal/protocol"
 )
 
-const maxWheelClicks = 20
-
 // Injector sends the restricted keyboard and pointer event set through XTEST.
 type Injector struct {
 	conn           *xgb.Conn
@@ -26,6 +28,8 @@ type Injector struct {
 	pressedButtons map[byte]struct{}
 }
 
+// New opens a connection to the X server and returns an injector ready to send
+// events. It fails if the X server cannot be reached or has no root screen.
 func New() (*Injector, error) {
 	if runtime.GOARCH != "amd64" {
 		return nil, fmt.Errorf("X11 input injection is unsupported on linux/%s; MVP requires linux/amd64", runtime.GOARCH)
@@ -43,15 +47,23 @@ func New() (*Injector, error) {
 		conn.Close()
 		return nil, errors.New("X11 server has no root screen")
 	}
-	return &Injector{conn: conn, root: setup.DefaultScreen(conn).Root, pressedKeys: make(map[byte]struct{}), pressedButtons: make(map[byte]struct{})}, nil
+	return &Injector{
+		conn:           conn,
+		root:           setup.DefaultScreen(conn).Root,
+		pressedKeys:    make(map[byte]struct{}),
+		pressedButtons: make(map[byte]struct{}),
+	}, nil
 }
 
+// Close releases the X11 connection.
 func (i *Injector) Close() {
 	if i != nil && i.conn != nil {
 		i.conn.Close()
 	}
 }
 
+// Key maps a USB HID keyboard usage to an X11 keycode and injects it, keeping
+// modifier keys in sync with the supplied modifier bitmap.
 func (i *Injector) Key(ctx context.Context, usage uint16, action protocol.Action, modifiers uint8) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -68,6 +80,7 @@ func (i *Injector) Key(ctx context.Context, usage uint16, action protocol.Action
 	return i.key(code, action)
 }
 
+// Move sends an absolute pointer motion event in host framebuffer pixels.
 func (i *Injector) Move(ctx context.Context, x, y uint32) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -80,6 +93,7 @@ func (i *Injector) Move(ctx context.Context, x, y uint32) error {
 	return xtest.FakeInputChecked(i.conn, xproto.MotionNotify, 0, 0, i.root, int16(x), int16(y), 0).Check()
 }
 
+// Button injects a pointer button press or release.
 func (i *Injector) Button(ctx context.Context, button protocol.Button, action protocol.Action) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -93,6 +107,7 @@ func (i *Injector) Button(ctx context.Context, button protocol.Button, action pr
 	return i.button(n, action)
 }
 
+// Wheel replays the wheel delta as a series of button press/release pairs.
 func (i *Injector) Wheel(ctx context.Context, horizontal, vertical int16) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -114,7 +129,12 @@ func (i *Injector) Wheel(ctx context.Context, horizontal, vertical int16) error 
 	return nil
 }
 
+// ReleaseAll sends release events for every key and button still held, so a
+// stuck key or button cannot persist after focus loss or disconnect.
 func (i *Injector) ReleaseAll(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if i == nil || i.conn == nil {
 		return nil
 	}
@@ -136,6 +156,8 @@ func (i *Injector) ReleaseAll(ctx context.Context) error {
 	return first
 }
 
+// key injects a single key event, tracking held keys to suppress duplicate
+// releases.
 func (i *Injector) key(code byte, action protocol.Action) error {
 	if action == protocol.ActionUp {
 		if _, ok := i.pressedKeys[code]; !ok {
@@ -156,6 +178,8 @@ func (i *Injector) key(code byte, action protocol.Action) error {
 	}
 	return nil
 }
+
+// button injects a single pointer button event, tracking held buttons.
 func (i *Injector) button(n byte, action protocol.Action) error {
 	if action == protocol.ActionUp {
 		if _, ok := i.pressedButtons[n]; !ok {
@@ -176,13 +200,23 @@ func (i *Injector) button(n byte, action protocol.Action) error {
 	}
 	return nil
 }
+
 func (i *Injector) fake(t, detail byte) error {
 	return xtest.FakeInputChecked(i.conn, t, detail, 0, i.root, 0, 0, 0).Check()
 }
 
+// modifierKeycodes lists the X11 keycodes for the four left-side modifiers,
+// ordered by the protocol modifier bitmap: bit0 = Shift, bit1 = Ctrl,
+// bit2 = Alt, bit3 = GUI. This matches the HID/Windows convention the client
+// emits, so a single press of, say, Ctrl+Shift drives the correct pair of
+// keycodes.
+var modifierKeycodes = [...]byte{50, 37, 64, 133}
+
+// syncModifiers adjusts the held modifier keycodes so they match the protocol
+// modifier bitmap, releasing ones that are no longer set and pressing ones that
+// are newly set.
 func (i *Injector) syncModifiers(bits uint8, eventCode byte) error {
-	codes := [...]byte{37, 50, 64, 133, 105, 62, 108, 134}
-	for bit, code := range codes {
+	for bit, code := range modifierKeycodes {
 		if code == eventCode {
 			continue
 		}
@@ -202,53 +236,7 @@ func (i *Injector) syncModifiers(bits uint8, eventCode byte) error {
 	return nil
 }
 
-func buttonNumber(button protocol.Button) byte {
-	switch button {
-	case protocol.ButtonLeft:
-		return 1
-	case protocol.ButtonMiddle:
-		return 2
-	case protocol.ButtonRight:
-		return 3
-	case protocol.ButtonBack:
-		return 8
-	case protocol.ButtonForward:
-		return 9
-	}
-	return 0
-}
-
-func wheelClicks(horizontal, vertical int16) ([]byte, error) {
-	if horizontal%120 != 0 || vertical%120 != 0 {
-		return nil, errors.New("wheel delta must be a multiple of 120")
-	}
-	h, v := int(horizontal/120), int(vertical/120)
-	if abs(h)+abs(v) > maxWheelClicks {
-		return nil, errors.New("wheel event exceeds click limit")
-	}
-	out := make([]byte, 0, abs(h)+abs(v))
-	for ; v > 0; v-- {
-		out = append(out, 4)
-	}
-	for ; v < 0; v++ {
-		out = append(out, 5)
-	}
-	for ; h > 0; h-- {
-		out = append(out, 7)
-	}
-	for ; h < 0; h++ {
-		out = append(out, 6)
-	}
-	return out, nil
-}
-func abs(v int) int {
-	if v < 0 {
-		return -v
-	}
-	return v
-}
-
-// keycodeForUsage maps a USB HID keyboard usage ID to the X11 keycode for a
+// keycodeForUsage maps a USB HID keyboard-page usage ID to the X11 keycode for a
 // standard US QWERTY keyboard. HID usage IDs for the letters are alphabetical
 // (A=0x04..Z=0x1d), but the X11 keycodes for those letters are not: the base
 // layout scatters them across the three letter rows (AC01..AC09, AD01..AD10,

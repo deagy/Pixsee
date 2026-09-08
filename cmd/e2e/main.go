@@ -25,7 +25,7 @@ import (
 	"virtualdesktop/internal/protocol"
 	"virtualdesktop/internal/transport"
 
-	capture_x11 "virtualdesktop/internal/host/capture/x11"
+	"virtualdesktop/internal/host/capture"
 )
 
 // --- test doubles ------------------------------------------------------------
@@ -106,19 +106,19 @@ func genTLS(t *testing.T) (serverTLS, clientTLS *tls.Config) {
 // --- real capture with retry past flaky NumActiveDisplays --------------------
 
 type realCapture struct {
-	c *capture_x11.Capture
+	c *capture.Capture
 }
 
 func (r *realCapture) Capture(ctx context.Context, displayID uint32) (damage.Image, error) {
 	return r.c.Capture(ctx, displayID)
 }
 
-// waitCapture retries until the real X11 capture returns a non-zero image,
+// waitCapture retries until the real platform capture returns a non-zero image,
 // working around the flaky screenshot library NumActiveDisplays() in headless
 // sandboxes where it intermittently returns 0.
 func waitCapture(t *testing.T) *realCapture {
 	t.Helper()
-	c := capture_x11.New()
+	c := capture.New()
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		img, err := c.Capture(context.Background(), 0)

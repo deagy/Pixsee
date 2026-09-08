@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"time"
 
-	capture_x11 "virtualdesktop/internal/host/capture/x11"
+	"virtualdesktop/internal/host/capture"
 )
 
 func main() {
-	c := capture_x11.New()
+	c := capture.New()
 	for i := 0; i < 15; i++ {
 		img, err := c.Capture(context.Background(), 0)
 		if err == nil && img.Width > 0 && img.Height > 0 {
