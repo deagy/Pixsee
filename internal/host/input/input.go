@@ -52,13 +52,13 @@ func wheelClicks(horizontal, vertical int16) ([]byte, error) {
 	for ; v > 0; v-- {
 		out = append(out, 4)
 	}
-	for ; v < 0; v-- {
+	for ; v < 0; v++ {
 		out = append(out, 5)
 	}
 	for ; h > 0; h-- {
 		out = append(out, 7)
 	}
-	for ; h < 0; h-- {
+	for ; h < 0; h++ {
 		out = append(out, 6)
 	}
 	return out, nil

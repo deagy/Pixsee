@@ -13,14 +13,14 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"syscall"
 	"unsafe"
 
-	"golang.org/x/sys/windows"
 	"virtualdesktop/internal/protocol"
 )
 
 var (
-	user32        = windows.NewLazyDLL("user32.dll")
+	user32        = syscall.NewLazyDLL("user32.dll")
 	sendInputProc = user32.NewProc("SendInput")
 )
 
@@ -38,11 +38,11 @@ const (
 
 // Mouse event flags.
 const (
-	MOUSEEVENTF_MOVE      = 0x0001
-	MOUSEEVENTF_LEFTDOWN  = 0x0002
-	MOUSEEVENTF_LEFTUP    = 0x0004
-	MOUSEEVENTF_RIGHTDOWN = 0x0008
-	MOUSEEVENTF_RIGHTUP   = 0x0010
+	MOUSEEVENTF_MOVE       = 0x0001
+	MOUSEEVENTF_LEFTDOWN   = 0x0002
+	MOUSEEVENTF_LEFTUP     = 0x0004
+	MOUSEEVENTF_RIGHTDOWN  = 0x0008
+	MOUSEEVENTF_RIGHTUP    = 0x0010
 	MOUSEEVENTF_MIDDLEDOWN = 0x0020
 	MOUSEEVENTF_MIDDLEUP   = 0x0040
 	MOUSEEVENTF_WHEEL      = 0x0800
@@ -58,12 +58,12 @@ const (
 // Time); it is normally zero, so the two low fields stay available for the
 // keyboard flags and time.
 type input struct {
-	Type uint32
-	Dx        int32
-	Dy        int32
-	MouseData uint32
-	DwFlags   uint32
-	Time      uint32
+	Type        uint32
+	Dx          int32
+	Dy          int32
+	MouseData   uint32
+	DwFlags     uint32
+	Time        uint32
 	DwExtraInfo uintptr
 }
 
@@ -192,23 +192,25 @@ func (i *Injector) Wheel(ctx context.Context, horizontal, vertical int16) error 
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	for _, n := range clicks {
+		var delta int16
 		switch n {
 		case 4:
-			if err := sendInput([]input{mouse(0, 0, 120, MOUSEEVENTF_WHEEL)}); err != nil {
-				return err
-			}
+			delta = 120
 		case 5:
-			if err := sendInput([]input{mouse(0, 0, -120, MOUSEEVENTF_WHEEL)}); err != nil {
-				return err
-			}
+			delta = -120
 		case 6:
-			if err := sendInput([]input{mouse(0, 0, 120, MOUSEEVENTF_XDOWN | MOUSEEVENTF_XUP)}); err != nil {
-				return err
-			}
+			delta = 120
 		case 7:
-			if err := sendInput([]input{mouse(0, 0, -120, MOUSEEVENTF_XDOWN | MOUSEEVENTF_XUP)}); err != nil {
+			delta = -120
+		}
+		if n == 6 || n == 7 {
+			if err := sendInput([]input{mouse(0, 0, uint32(int32(delta)), MOUSEEVENTF_XDOWN|MOUSEEVENTF_XUP)}); err != nil {
 				return err
 			}
+			continue
+		}
+		if err := sendInput([]input{mouse(0, 0, uint32(int32(delta)), MOUSEEVENTF_WHEEL)}); err != nil {
+			return err
 		}
 	}
 	return nil

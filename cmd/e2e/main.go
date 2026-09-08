@@ -60,11 +60,11 @@ type recInput struct {
 	releases int
 }
 
-func (i *recInput) Key(context.Context, uint16, protocol.Action, uint8) error   { i.keys++; return nil }
-func (i *recInput) Move(context.Context, uint32, uint32) error                  { return nil }
+func (i *recInput) Key(context.Context, uint16, protocol.Action, uint8) error      { i.keys++; return nil }
+func (i *recInput) Move(context.Context, uint32, uint32) error                     { return nil }
 func (i *recInput) Button(context.Context, protocol.Button, protocol.Action) error { return nil }
-func (i *recInput) Wheel(context.Context, int16, int16) error                   { return nil }
-func (i *recInput) ReleaseAll(context.Context) error                            { i.releases++; return nil }
+func (i *recInput) Wheel(context.Context, int16, int16) error                      { return nil }
+func (i *recInput) ReleaseAll(context.Context) error                               { i.releases++; return nil }
 
 // --- TLS ---------------------------------------------------------------------
 
