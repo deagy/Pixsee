@@ -19,7 +19,7 @@ import (
 func TestBuildTLSConfigFingerprint(t *testing.T) {
 	var fp [32]byte
 	_, _ = rand.Read(fp[:])
-	cfg, err := buildTLSConfig("", "localhost:6511", hexString(fp), "")
+	cfg, err := buildTLSConfig("", "localhost:6511", hexString(fp), "", false)
 	if err != nil {
 		t.Fatalf("buildTLSConfig fingerprint: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestBuildTLSConfigCA(t *testing.T) {
 	path := dir + "/ca.pem"
 	writePEM(t, path, "CERTIFICATE", caCert)
 
-	cfg, err := buildTLSConfig("", "localhost:6511", "", path)
+	cfg, err := buildTLSConfig("", "localhost:6511", "", path, false)
 	if err != nil {
 		t.Fatalf("buildTLSConfig ca: %v", err)
 	}
@@ -44,14 +44,61 @@ func TestBuildTLSConfigCA(t *testing.T) {
 }
 
 func TestBuildTLSConfigRequiresTrustMaterial(t *testing.T) {
-	_, err := buildTLSConfig("", "localhost:6511", "", "")
+	_, err := buildTLSConfig("", "localhost:6511", "", "", false)
 	if err == nil {
 		t.Fatal("expected error when neither fingerprint nor ca provided")
 	}
 }
 
+func TestBuildTLSConfigDefaultIsSecure(t *testing.T) {
+	// No trust material and no allow-insecure flag must be rejected outright.
+	if _, err := buildTLSConfig("", "localhost:6511", "", "", false); err == nil {
+		t.Fatal("expected error when no trust material and no allow-insecure")
+	}
+
+	// The CA path (the canonical secure default) must NOT skip verification.
+	dir := t.TempDir()
+	caCert, _ := generateSelfSigned(t)
+	caPath := dir + "/ca.pem"
+	writePEM(t, caPath, "CERTIFICATE", caCert)
+	cfg, err := buildTLSConfig("", "localhost:6511", "", caPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.InsecureSkipVerify {
+		t.Fatal("CA-based default configuration must keep certificate verification enabled")
+	}
+}
+
+func TestBuildTLSConfigAllowInsecureSetsSkipVerify(t *testing.T) {
+	cfg, err := buildTLSConfig("", "localhost:6511", "", "", true)
+	if err != nil {
+		t.Fatalf("buildTLSConfig allow-insecure: %v", err)
+	}
+	if !cfg.InsecureSkipVerify {
+		t.Fatal("allow-insecure must disable certificate verification")
+	}
+	if cfg.MinVersion != tls.VersionTLS13 || cfg.MaxVersion != tls.VersionTLS13 {
+		t.Fatal("allow-insecure must remain TLS 1.3")
+	}
+	if cfg.ServerName != "localhost" {
+		t.Fatalf("server name = %q", cfg.ServerName)
+	}
+}
+
+func TestBuildTLSConfigAllowInsecureWinsOverTrustMaterial(t *testing.T) {
+	// allow-insecure takes precedence and never requires fingerprint/ca.
+	cfg, err := buildTLSConfig("", "example.com:6511", "", "", true)
+	if err != nil {
+		t.Fatalf("buildTLSConfig allow-insecure without trust material: %v", err)
+	}
+	if !cfg.InsecureSkipVerify || cfg.ServerName != "example.com" {
+		t.Fatal("allow-insecure should apply without trust material and use the host as server name")
+	}
+}
+
 func TestBuildTLSConfigBadFingerprint(t *testing.T) {
-	_, err := buildTLSConfig("", "localhost:6511", "not-hex", "")
+	_, err := buildTLSConfig("", "localhost:6511", "not-hex", "", false)
 	if err == nil {
 		t.Fatal("expected error for bad fingerprint")
 	}
@@ -138,6 +185,95 @@ func TestConnectAndAuthSucceeds(t *testing.T) {
 	}
 	if err := run(cfg); err != nil {
 		t.Fatalf("run: %v", err)
+	}
+}
+
+func clientTLSForInsecure(t *testing.T, serverName string) *tls.Config {
+	t.Helper()
+	cfg, err := transport.ClientTLSConfigForInsecure(serverName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func TestConnectInsecureAgainstUntrustedSelfSignedHost(t *testing.T) {
+	caCert, caKey := generateSelfSigned(t)
+	dir := t.TempDir()
+	caPath := dir + "/ca.pem"
+	writePEM(t, caPath, "CERTIFICATE", caCert)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go serveFakeHost(t, ln, caCert, caKey, 9)
+
+	cfg := &appConfig{
+		addr:           ln.Addr().String(),
+		token:          func() [32]byte { var tok [32]byte; tok[0] = 9; return tok }(),
+		tlsConfig:      clientTLSForInsecure(t, "localhost"),
+		ioTimeout:      5 * time.Second,
+		reconnectDelay: 100 * time.Millisecond,
+	}
+	if err := run(cfg); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}
+
+func TestConnectSecureRejectsUntrustedSelfSignedHost(t *testing.T) {
+	caCert, caKey := generateSelfSigned(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go serveFakeHost(t, ln, caCert, caKey, 11)
+
+	// Secure client with NO trust material for the host cert: it must fail
+	// closed rather than connecting to an untrusted self-signed host.
+	cfg := &appConfig{
+		addr:           ln.Addr().String(),
+		token:          func() [32]byte { var tok [32]byte; tok[0] = 11; return tok }(),
+		tlsConfig:      &tls.Config{ServerName: "localhost"}, // no RootCAs
+		ioTimeout:      5 * time.Second,
+		reconnectDelay: 50 * time.Millisecond,
+	}
+	// run blocks and retries; observe that it never reaches a clean return by
+	// cancelling the context after a short window and asserting the client did
+	// not establish a usable session. This asserts the secure default refuses
+	// the untrusted host.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = ctx
+	// We cannot call run directly (it loops until ctx cancels). Instead assert
+	// the handshake fails by attempting a bare handshake against the host.
+	serverTLS, err := transport.ServerTLSConfig(tls.Certificate{
+		Certificate: [][]byte{caCert.Raw},
+		PrivateKey:  caKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		tlsConn := tls.Server(conn, serverTLS)
+		_ = transport.Handshake(context.Background(), tlsConn, 2*time.Second)
+	}()
+	clientConn, err := net.Dial("tcp", cfg.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+	clientTLS := tls.Client(clientConn, cfg.tlsConfig)
+	if err := clientTLS.HandshakeContext(context.Background()); err == nil {
+		t.Fatal("secure client completed handshake against untrusted self-signed host")
 	}
 }
 

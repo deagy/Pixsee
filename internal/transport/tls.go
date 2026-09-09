@@ -24,6 +24,24 @@ func ServerTLSConfig(certificate tls.Certificate) (*tls.Config, error) {
 	}, nil
 }
 
+// ClientTLSConfigForInsecure returns a TLS 1.3 client configuration that
+// disables server certificate and hostname verification. It exists only to
+// connect to hosts with invalid or self-signed certificates, for example in
+// isolated or lab environments. It MUST be opt-in: the default path never
+// sets InsecureSkipVerify, and callers should prefer pinning a fingerprint or
+// supplying a CA pool instead.
+func ClientTLSConfigForInsecure(serverName string) (*tls.Config, error) {
+	if serverName == "" {
+		return nil, errors.New("server name is required")
+	}
+	return &tls.Config{
+		MinVersion:         tls.VersionTLS13,
+		MaxVersion:         tls.VersionTLS13,
+		ServerName:         serverName,
+		InsecureSkipVerify: true,
+	}, nil
+}
+
 func ClientTLSConfig(serverName string, roots *x509.CertPool) (*tls.Config, error) {
 	if serverName == "" || roots == nil {
 		return nil, errors.New("server name and certificate roots are required")
