@@ -55,6 +55,8 @@ After TLS is established, the client sends an `AUTH` message containing a versio
 
 Assumptions requiring confirmation: operators can provision or pin a certificate and distribute a 256-bit token out of band. Public-key client identity, multiple users, authorization roles, token rotation without restart, and revocation are deferred.
 
+Tokenless mode: either side may run without an operator-supplied token. A host started without `-token` accepts any non-zero client token (no-authentication mode); a client started without `-token` mints a random non-zero bearer token and connects to such a host. The wire invariant forbidding a zero token is still enforced, so tokenless mode never weakens the wire — it simply omits a shared secret when neither side requires one. Host certificate trust is orthogonal to the token: a tokenless client still verifies the host certificate via `-ca`, `-fingerprint`, or the opt-in `-allow-insecure` flag.
+
 ### 4.2 Framing and limits
 
 All protocol integers are unsigned big-endian unless explicitly signed. Each record has a fixed header:

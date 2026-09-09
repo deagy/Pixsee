@@ -147,7 +147,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 func TestLoadConfigRejectsMissingAddr(t *testing.T) {
 	var fp [32]byte
 	_, _ = rand.Read(fp[:])
-	_, err := loadConfig([]string{"-fingerprint", hexString(fp)})
+	// An explicit empty -addr is rejected. (addr otherwise defaults to
+	// localhost:6511, so the test must pass it explicitly to be meaningful.)
+	_, err := loadConfig([]string{"-addr", "", "-fingerprint", hexString(fp)})
 	if err == nil {
 		t.Fatal("expected error when addr missing")
 	}
@@ -185,6 +187,74 @@ func TestConnectAndAuthSucceeds(t *testing.T) {
 	}
 	if err := run(cfg); err != nil {
 		t.Fatalf("run: %v", err)
+	}
+}
+
+// serveFakeNoAuthHost is a host that started with no token: AuthenticateHost
+// accepts any non-zero client token. It drives the client through a full
+// session and closes cleanly.
+func serveFakeNoAuthHost(t *testing.T, ln net.Listener, caCert *x509.Certificate, caKey interface{}) {
+	t.Helper()
+	serverTLS, err := transport.ServerTLSConfig(tls.Certificate{
+		Certificate: [][]byte{caCert.Raw},
+		PrivateKey:  caKey,
+	})
+	if err != nil {
+		return
+	}
+	conn, err := ln.Accept()
+	if err != nil {
+		return
+	}
+	tlsConn := tls.Server(conn, serverTLS)
+	if err := transport.Handshake(context.Background(), tlsConn, 5*time.Second); err != nil {
+		return
+	}
+	peer := transport.NewPeerConn(tlsConn, conn, protocol.RoleHost, protocol.DefaultLimits(), 5*time.Second)
+	// Zero expected token => no-authentication mode: accept any non-zero token.
+	if err := peer.AuthenticateHost(context.Background(), [32]byte{}); err != nil {
+		return
+	}
+	if _, err := peer.Receive(context.Background()); err != nil {
+		return
+	}
+	_ = peer.Send(context.Background(), protocol.ServerHello{Version: 1})
+	_ = peer.Send(context.Background(), protocol.DisplayConfig{
+		Generation: 1, Width: 2, Height: 1, PixelFormat: protocol.PixelBGRA8888,
+	})
+	_ = peer.Send(context.Background(), protocol.Close{Code: 0, Reason: "done"})
+}
+
+// TestConnectTokenlessProvesNoTokenPath proves the tokenless client end to end:
+// with no -token the CLI config mints a random non-zero bearer token, and the
+// client completes a full session against a host in no-authentication mode.
+func TestConnectTokenlessProvesNoTokenPath(t *testing.T) {
+	caCert, caKey := generateSelfSigned(t)
+	dir := t.TempDir()
+	caPath := dir + "/ca.pem"
+	writePEM(t, caPath, "CERTIFICATE", caCert)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go serveFakeNoAuthHost(t, ln, caCert, caKey)
+
+	// No -token: this exercises the real CLI-less tokenless path, which mints a
+	// random non-zero bearer token before connecting. Trust is via -ca so the
+	// client still verifies the host certificate (tokenless != trustless).
+	// server-name is localhost to match the test certificate's SAN.
+	cfg, err := loadConfig([]string{"-addr", ln.Addr().String(), "-server-name", "localhost", "-ca", caPath})
+	if err != nil {
+		t.Fatalf("loadConfig tokenless: %v", err)
+	}
+	if cfg.token == [32]byte{} {
+		t.Fatal("expected a non-zero token to be minted in tokenless mode")
+	}
+	if err := run(cfg); err != nil {
+		t.Fatalf("tokenless run: %v", err)
 	}
 }
 
