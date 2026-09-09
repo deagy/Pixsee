@@ -19,7 +19,7 @@ import (
 	"virtualdesktop/internal/protocol"
 	"virtualdesktop/internal/transport"
 
-	capture_x11 "virtualdesktop/internal/host/capture/x11"
+	capture_x11 "virtualdesktop/internal/host/capture"
 )
 
 // hostInput is a shared input recorder for the real e2e test.
