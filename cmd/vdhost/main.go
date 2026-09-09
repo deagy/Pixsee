@@ -28,11 +28,13 @@ import (
 )
 
 // loadToken reads a 32-byte authentication token from a file. It accepts either
-// 32 raw bytes or 64 hexadecimal characters.
+// 32 raw bytes or 64 hexadecimal characters. An empty path yields the zero
+// token, which the host treats as no-authentication mode (any non-zero client
+// token is accepted). A provided path is still strictly validated.
 func loadToken(path string) ([32]byte, error) {
 	var token [32]byte
 	if path == "" {
-		return token, errors.New("token path is required")
+		return token, nil
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -106,6 +108,9 @@ func loadConfig(args []string) (*appConfig, error) {
 		return nil, fmt.Errorf("host: token: %w", err)
 	}
 	cfg.token = token
+	if cfg.token == [32]byte{} {
+		fmt.Fprintln(os.Stderr, "vdhost: WARNING: no -token supplied; accepting any client token (no authentication)")
+	}
 	tlsConfig, err := buildTLSConfig(*caPath, *keyPath)
 	if err != nil {
 		return nil, err
@@ -120,7 +125,10 @@ func loadConfig(args []string) (*appConfig, error) {
 
 func buildTLSConfig(caPath, keyPath string) (*tls.Config, error) {
 	if caPath == "" || keyPath == "" {
-		return nil, errors.New("host: -ca and -key are required")
+		// No certificate supplied: serve an ephemeral in-memory self-signed
+		// cert so TLS 1.3 still runs. A client must opt in (allow-insecure or
+		// fingerprint) to trust it.
+		return transport.EphemeralServerTLSConfig()
 	}
 	cert, err := tls.LoadX509KeyPair(caPath, keyPath)
 	if err != nil {
