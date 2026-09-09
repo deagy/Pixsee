@@ -2,16 +2,63 @@ package transport
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
+	"math/big"
 	"time"
 )
 
 var ErrCertificatePin = errors.New("server certificate fingerprint mismatch")
+
+// EphemeralServerCertificate generates an in-memory, self-signed TLS 1.3
+// server certificate valid for "localhost". It exists so a host can serve TLS
+// without an operator-supplied certificate, for example in isolated or lab
+// environments. The private key never leaves the process and is never logged.
+// A client reaching such a host must opt in with -allow-insecure or -fingerprint.
+func EphemeralServerCertificate() (tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(now.UnixNano()),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		DNSNames:     []string{"localhost"},
+		NotBefore:    now.Add(-time.Minute),
+		NotAfter:     now.Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: cert}, nil
+}
+
+// EphemeralServerTLSConfig builds a TLS 1.3 server configuration backed by a
+// freshly generated self-signed certificate. It is the no-CA path for host
+// creation. The private key is generated in memory and never logged.
+func EphemeralServerTLSConfig() (*tls.Config, error) {
+	certificate, err := EphemeralServerCertificate()
+	if err != nil {
+		return nil, err
+	}
+	return ServerTLSConfig(certificate)
+}
 
 func ServerTLSConfig(certificate tls.Certificate) (*tls.Config, error) {
 	if len(certificate.Certificate) == 0 || certificate.PrivateKey == nil {

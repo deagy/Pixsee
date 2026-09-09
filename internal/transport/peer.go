@@ -136,7 +136,22 @@ func (p *Peer) AuthenticateHost(ctx context.Context, expected [32]byte) error {
 		return ErrAuthentication
 	}
 	auth, ok := message.(protocol.Auth)
-	if !ok || auth.Version != protocol.Version1 || subtle.ConstantTimeCompare(auth.Token[:], expected[:]) != 1 {
+	if !ok || auth.Version != protocol.Version1 {
+		p.Close()
+		return ErrAuthentication
+	}
+	var zero [32]byte
+	if auth.Token == zero {
+		// The wire invariant forbids a zero token, but reject it explicitly.
+		p.Close()
+		return ErrAuthentication
+	}
+	if subtle.ConstantTimeCompare(expected[:], zero[:]) == 1 {
+		// No token configured on the host: accept any non-zero client token.
+		// This is no-authentication mode, not weak authentication.
+		return nil
+	}
+	if subtle.ConstantTimeCompare(auth.Token[:], expected[:]) != 1 {
 		p.Close()
 		return ErrAuthentication
 	}
