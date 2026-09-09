@@ -45,13 +45,14 @@ type appConfig struct {
 func loadConfig(args []string) (*appConfig, error) {
 	fs := flag.NewFlagSet("vdclient", flag.ContinueOnError)
 	var (
-		addr        = fs.String("addr", "localhost:6511", "host:port to connect to")
-		serverName  = fs.String("server-name", "", "TLS server name (defaults to the host part of -addr)")
-		tokenPath   = fs.String("token", "", "path to the 32-byte authentication token (raw or hex)")
-		fingerprint = fs.String("fingerprint", "", "exact SHA-256 certificate fingerprint to pin (64 hex chars, colons optional)")
-		caPath      = fs.String("ca", "", "path to a PEM CA bundle that signs the host certificate")
-		timeout     = fs.Duration("timeout", 10*time.Second, "per-operation I/O deadline")
-		reconnect   = fs.Duration("reconnect-delay", time.Second, "delay before a reconnect attempt")
+		addr          = fs.String("addr", "localhost:6511", "host:port to connect to")
+		serverName    = fs.String("server-name", "", "TLS server name (defaults to the host part of -addr)")
+		tokenPath     = fs.String("token", "", "path to the 32-byte authentication token (raw or hex)")
+		fingerprint   = fs.String("fingerprint", "", "exact SHA-256 certificate fingerprint to pin (64 hex chars, colons optional)")
+		caPath        = fs.String("ca", "", "path to a PEM CA bundle that signs the host certificate")
+		allowInsecure = fs.Bool("allow-insecure", false, "skip host certificate verification (use only with self-signed/untrusted hosts)")
+		timeout       = fs.Duration("timeout", 10*time.Second, "per-operation I/O deadline")
+		reconnect     = fs.Duration("reconnect-delay", time.Second, "delay before a reconnect attempt")
 	)
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -63,7 +64,7 @@ func loadConfig(args []string) (*appConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("client: token: %w", err)
 	}
-	tlsConfig, err := buildTLSConfig(*serverName, *addr, *fingerprint, *caPath)
+	tlsConfig, err := buildTLSConfig(*serverName, *addr, *fingerprint, *caPath, *allowInsecure)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +80,7 @@ func loadConfig(args []string) (*appConfig, error) {
 
 func (c *appConfig) title() string { return "Virtual Desktop — " + c.addr }
 
-func buildTLSConfig(serverName, addr, fingerprint, caPath string) (*tls.Config, error) {
+func buildTLSConfig(serverName, addr, fingerprint, caPath string, allowInsecure bool) (*tls.Config, error) {
 	if serverName == "" {
 		if host, _, err := net.SplitHostPort(addr); err == nil {
 			serverName = host
@@ -88,6 +89,8 @@ func buildTLSConfig(serverName, addr, fingerprint, caPath string) (*tls.Config, 
 		}
 	}
 	switch {
+	case allowInsecure:
+		return transport.ClientTLSConfigForInsecure(serverName)
 	case fingerprint != "":
 		fp, err := parseFingerprint(fingerprint)
 		if err != nil {
@@ -101,7 +104,7 @@ func buildTLSConfig(serverName, addr, fingerprint, caPath string) (*tls.Config, 
 		}
 		return transport.ClientTLSConfig(serverName, roots)
 	default:
-		return nil, errors.New("client: one of -fingerprint or -ca is required")
+		return nil, errors.New("client: one of -allow-insecure, -fingerprint, or -ca is required")
 	}
 }
 

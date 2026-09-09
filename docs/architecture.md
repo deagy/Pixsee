@@ -46,9 +46,9 @@ TLS requirements:
 
 - minimum and maximum version are TLS 1.3 for the MVP;
 - the host presents an operator-provisioned certificate;
-- the client validates the configured CA or an exact SHA-256 certificate fingerprint;
-- an `insecure-skip-verify` production mode is forbidden;
-- private keys and tokens MUST NOT be logged; and
+|- the client validates the configured CA or an exact SHA-256 certificate fingerprint;
+|- certificate verification is on by default and forbidden in production; an opt-in `-allow-insecure` client flag exists only for lab/isolated use against self-signed hosts and disables verification via `InsecureSkipVerify`;
+|- private keys and tokens MUST NOT be logged; and
 - handshake, authentication, reads, and writes use explicit deadlines and honor context cancellation.
 
 After TLS is established, the client sends an `AUTH` message containing a version identifier and a 32-byte cryptographically random bearer token. The host compares it in constant time to its configured token. Authentication failure returns only a generic error and closes the connection. A token is transmitted only inside validated TLS, is stored with owner-only filesystem permissions when file-backed, and can be rotated by restarting the MVP host. Rate limiting is not a substitute for the loopback default or TLS.

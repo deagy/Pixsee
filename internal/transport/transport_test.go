@@ -128,6 +128,139 @@ func TestAuthenticationRejectsPlaintext(t *testing.T) {
 	}
 }
 
+func TestClientTLSConfigForInsecureSkipsVerification(t *testing.T) {
+	config, err := ClientTLSConfigForInsecure("localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config == nil {
+		t.Fatal("expected insecure config")
+	}
+	if !config.InsecureSkipVerify {
+		t.Fatal("insecure config must disable certificate verification")
+	}
+	if config.MinVersion != tls.VersionTLS13 || config.MaxVersion != tls.VersionTLS13 {
+		t.Fatal("insecure config must remain TLS 1.3")
+	}
+
+	if _, err := ClientTLSConfigForInsecure(""); err == nil {
+		t.Fatal("expected error for empty server name")
+	}
+}
+
+func TestInsecureClientHandshakesWithUntrustedSelfSignedServer(t *testing.T) {
+	// The server presents a self-signed certificate that is NOT trusted by any
+	// root. A secure client would reject the handshake; the insecure client
+	// (InsecureSkipVerify) must still complete it.
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		DNSNames:              []string{"localhost"},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certChain := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: cert}
+
+	serverConfig := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		MaxVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{certChain},
+	}
+	clientConfig, err := ClientTLSConfigForInsecure("localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverRaw, clientRaw := net.Pipe()
+	serverTLS := tls.Server(serverRaw, serverConfig)
+	clientTLS := tls.Client(clientRaw, clientConfig)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	serverResult := make(chan error, 1)
+	go func() { serverResult <- Handshake(ctx, serverTLS, time.Second) }()
+	if err := Handshake(ctx, clientTLS, time.Second); err != nil {
+		t.Fatalf("insecure client failed handshake against untrusted self-signed server: %v", err)
+	}
+	if err := <-serverResult; err != nil {
+		t.Fatalf("server handshake failed: %v", err)
+	}
+}
+
+func TestSecureClientRejectsUntrustedSelfSignedServer(t *testing.T) {
+	// The server presents a self-signed certificate the client has never seen
+	// and does not trust via system roots. A secure client MUST reject the
+	// handshake, proving the insecure path is meaningfully different.
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		DNSNames:              []string{"localhost"},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certChain := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+
+	serverConfig := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		MaxVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{certChain},
+	}
+	// No RootCAs: rely on the system pool, which will not contain our
+	// throwaway self-signed certificate.
+	clientConfig := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		MaxVersion: tls.VersionTLS13,
+		ServerName: "localhost",
+	}
+
+	serverRaw, clientRaw := net.Pipe()
+	serverTLS := tls.Server(serverRaw, serverConfig)
+	clientTLS := tls.Client(clientRaw, clientConfig)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	serverResult := make(chan error, 1)
+	go func() { serverResult <- Handshake(ctx, serverTLS, time.Second) }()
+	if err := Handshake(ctx, clientTLS, time.Second); err == nil {
+		t.Fatal("secure client completed handshake against untrusted self-signed server")
+	}
+	<-serverResult
+}
+
 func TestTLSIsVersion13OnlyAndFingerprintPinned(t *testing.T) {
 	certificate, leaf := testCertificate(t)
 	serverConfig, err := ServerTLSConfig(certificate)
