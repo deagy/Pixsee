@@ -1,10 +1,16 @@
 // Command vdclient is the virtual desktop client. It connects to a host over
 // TLS 1.3, authenticates with a 32-byte token, and presents the remote display
 // through the chosen renderer while forwarding only keyboard and pointer input.
+//
+// Without -token the client runs in tokenless mode: it generates a random
+// non-zero bearer token to send on the wire (the wire invariant forbids a zero
+// token), which a host in no-authentication mode accepts. Both modes remain
+// supported; a host that requires a specific token still needs -token.
 package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -63,6 +69,16 @@ func loadConfig(args []string) (*appConfig, error) {
 	token, err := loadToken(*tokenPath)
 	if err != nil {
 		return nil, fmt.Errorf("client: token: %w", err)
+	}
+	if token == [32]byte{} {
+		// No -token supplied: tokenless mode. The wire invariant forbids a
+		// zero token, so mint a random non-zero bearer token. A host in
+		// no-authentication mode accepts any non-zero token, mirroring the
+		// host's own tokenless mode.
+		if _, err := rand.Read(token[:]); err != nil {
+			return nil, fmt.Errorf("client: token: %w", err)
+		}
+		fmt.Fprintln(os.Stderr, "vdclient: WARNING: no -token supplied; using a random token (tokenless mode against a no-authentication host)")
 	}
 	tlsConfig, err := buildTLSConfig(*serverName, *addr, *fingerprint, *caPath, *allowInsecure)
 	if err != nil {

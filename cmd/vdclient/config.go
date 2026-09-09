@@ -8,8 +8,16 @@ import (
 	"strings"
 )
 
+// loadToken reads a 32-byte authentication token from a file. An empty path
+// yields the zero token, which the client treats as tokenless mode: at connect
+// time a random non-zero bearer token is minted so the wire invariant (no zero
+// token) still holds and a no-authentication host can admit the client. A
+// provided path is still strictly validated.
 func loadToken(path string) ([32]byte, error) {
 	var token [32]byte
+	if path == "" {
+		return token, nil
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return token, err

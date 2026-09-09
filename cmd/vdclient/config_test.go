@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -31,6 +32,37 @@ func TestLoadTokenAcceptsRawOrHexAndRejectsWrongLength(t *testing.T) {
 	_ = os.WriteFile(bad, []byte("short"), 0o600)
 	if _, err := loadToken(bad); err == nil {
 		t.Fatal("accepted short token")
+	}
+}
+
+// TestLoadConfigTokenlessMintsRandomToken proves the tokenless path: with no
+// -token the client mints a random non-zero bearer token so it can talk to a
+// host in no-authentication mode, and a provided token is still honored.
+func TestLoadConfigTokenlessMintsRandomToken(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := dir + "/token"
+	if err := writeFile(tokenPath, make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	var fp [32]byte
+	_, _ = rand.Read(fp[:])
+
+	// Tokenless: no -token -> non-zero random token.
+	cfg, err := loadConfig([]string{"-addr", "localhost:6511", "-fingerprint", hexString(fp)})
+	if err != nil {
+		t.Fatalf("loadConfig tokenless: %v", err)
+	}
+	if cfg.token == [32]byte{} {
+		t.Fatal("expected a non-zero token in tokenless mode")
+	}
+
+	// Token-based: -token still honored.
+	cfg, err = loadConfig([]string{"-addr", "localhost:6511", "-token", tokenPath, "-fingerprint", hexString(fp)})
+	if err != nil {
+		t.Fatalf("loadConfig with token: %v", err)
+	}
+	if cfg.token == [32]byte{} {
+		t.Fatal("expected the provided token to be honored")
 	}
 }
 
