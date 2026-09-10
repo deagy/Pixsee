@@ -22,10 +22,25 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 
+	"virtualdesktop/internal/cliconfig"
 	"virtualdesktop/internal/client"
 	"virtualdesktop/internal/transport"
 )
+
+// configEnvPrefix is the prefix vdclient uses for configuration environment
+// variables: every flag is also settable as VDCLIENT_<FLAG_NAME>, upper-cased
+// with dashes turned into underscores (e.g. -allow-insecure also reads
+// VDCLIENT_ALLOW_INSECURE). See internal/cliconfig for full precedence rules
+// (flag > env > config file > default).
+const configEnvPrefix = "VDCLIENT"
+
+// configFileName is the base name (without extension) vdclient looks for
+// when -config is not given, searched for as vdclient.yaml/.yml/.json/...
+// in the current directory, $HOME/.config/virtualdesktop, then
+// /etc/virtualdesktop.
+const configFileName = "vdclient"
 
 func main() {
 	cmd := newRootCmd()
@@ -75,28 +90,28 @@ func (e *flagError) Unwrap() error { return e.err }
 // and wires them into an appConfig identically to the pre-Cobra flag package
 // implementation, so existing flags, defaults, and behavior are unchanged.
 func newRootCmd() *cobra.Command {
-	var (
-		addr          string
-		serverName    string
-		tokenPath     string
-		fingerprint   string
-		caPath        string
-		allowInsecure bool
-		timeout       time.Duration
-		reconnect     time.Duration
-	)
+	var configFile string
 
 	cmd := &cobra.Command{
 		Use:   "vdclient",
 		Short: "Virtual desktop client",
 		Long: "vdclient connects to a host over TLS 1.3, authenticates with a 32-byte\n" +
 			"token, and presents the remote display while forwarding only keyboard\n" +
-			"and pointer input.",
+			"and pointer input.\n\n" +
+			"Configuration values are resolved with the following precedence (highest\n" +
+			"first): command-line flag, environment variable (VDCLIENT_<FLAG_NAME>, e.g.\n" +
+			"VDCLIENT_ADDR or VDCLIENT_ALLOW_INSECURE), YAML config file (-config, or\n" +
+			"vdclient.yaml found in ., $HOME/.config/virtualdesktop, or\n" +
+			"/etc/virtualdesktop), then the flag's default.",
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := buildConfig(addr, serverName, tokenPath, fingerprint, caPath, allowInsecure, timeout, reconnect)
+			v, err := cliconfig.New(cmd.Flags(), cliconfig.Options{ConfigName: configFileName, EnvPrefix: configEnvPrefix}, configFile)
+			if err != nil {
+				return &flagError{err}
+			}
+			cfg, err := buildConfigFromViper(v)
 			if err != nil {
 				return &flagError{err}
 			}
@@ -112,14 +127,15 @@ func newRootCmd() *cobra.Command {
 	})
 
 	fs := cmd.Flags()
-	fs.StringVar(&addr, "addr", "localhost:6511", "host:port to connect to")
-	fs.StringVar(&serverName, "server-name", "", "TLS server name (defaults to the host part of -addr)")
-	fs.StringVar(&tokenPath, "token", "", "path to the 32-byte authentication token (raw or hex)")
-	fs.StringVar(&fingerprint, "fingerprint", "", "exact SHA-256 certificate fingerprint to pin (64 hex chars, colons optional)")
-	fs.StringVar(&caPath, "ca", "", "path to a PEM CA bundle that signs the host certificate")
-	fs.BoolVar(&allowInsecure, "allow-insecure", false, "skip host certificate verification (use only with self-signed/untrusted hosts)")
-	fs.DurationVar(&timeout, "timeout", 10*time.Second, "per-operation I/O deadline")
-	fs.DurationVar(&reconnect, "reconnect-delay", time.Second, "delay before a reconnect attempt")
+	fs.StringVar(&configFile, "config", "", "path to a YAML config file (default: search for vdclient.yaml in ., $HOME/.config/virtualdesktop, /etc/virtualdesktop)")
+	fs.String("addr", "localhost:6511", "host:port to connect to")
+	fs.String("server-name", "", "TLS server name (defaults to the host part of -addr)")
+	fs.String("token", "", "path to the 32-byte authentication token (raw or hex)")
+	fs.String("fingerprint", "", "exact SHA-256 certificate fingerprint to pin (64 hex chars, colons optional)")
+	fs.String("ca", "", "path to a PEM CA bundle that signs the host certificate")
+	fs.Bool("allow-insecure", false, "skip host certificate verification (use only with self-signed/untrusted hosts)")
+	fs.Duration("timeout", 10*time.Second, "per-operation I/O deadline")
+	fs.Duration("reconnect-delay", time.Second, "delay before a reconnect attempt")
 
 	return cmd
 }
@@ -134,9 +150,19 @@ type appConfig struct {
 	reconnectDelay time.Duration
 }
 
-// buildConfig performs the same validation and defaulting the pre-Cobra
-// loadConfig used to perform, now over already-parsed flag values.
-func buildConfig(addr, serverName, tokenPath, fingerprint, caPath string, allowInsecure bool, timeout, reconnect time.Duration) (*appConfig, error) {
+// buildConfigFromViper performs the same validation and defaulting the
+// pre-Cobra loadConfig used to perform, now reading already-resolved values
+// (flag > env > config file > default) from v.
+func buildConfigFromViper(v *viper.Viper) (*appConfig, error) {
+	addr := v.GetString("addr")
+	serverName := v.GetString("server-name")
+	tokenPath := v.GetString("token")
+	fingerprint := v.GetString("fingerprint")
+	caPath := v.GetString("ca")
+	allowInsecure := v.GetBool("allow-insecure")
+	timeout := v.GetDuration("timeout")
+	reconnect := v.GetDuration("reconnect-delay")
+
 	if addr == "" {
 		return nil, errors.New("client: -addr is required")
 	}
@@ -169,7 +195,9 @@ func buildConfig(addr, serverName, tokenPath, fingerprint, caPath string, allowI
 }
 
 // loadConfig retains the pre-Cobra entrypoint signature for callers (and
-// tests) that parse raw CLI args directly, without going through Cobra.
+// tests) that parse raw CLI args directly, without going through Cobra. It
+// still applies the full flag > env (VDCLIENT_*) > config file > default
+// precedence via internal/cliconfig.
 func loadConfig(args []string) (*appConfig, error) {
 	cmd := newRootCmd()
 	cmd.RunE = nil
@@ -180,15 +208,12 @@ func loadConfig(args []string) (*appConfig, error) {
 	if err := cobra.NoArgs(cmd, fs.Args()); err != nil {
 		return nil, err
 	}
-	addr, _ := fs.GetString("addr")
-	serverName, _ := fs.GetString("server-name")
-	tokenPath, _ := fs.GetString("token")
-	fingerprint, _ := fs.GetString("fingerprint")
-	caPath, _ := fs.GetString("ca")
-	allowInsecure, _ := fs.GetBool("allow-insecure")
-	timeout, _ := fs.GetDuration("timeout")
-	reconnect, _ := fs.GetDuration("reconnect-delay")
-	return buildConfig(addr, serverName, tokenPath, fingerprint, caPath, allowInsecure, timeout, reconnect)
+	configFile, _ := fs.GetString("config")
+	v, err := cliconfig.New(fs, cliconfig.Options{ConfigName: configFileName, EnvPrefix: configEnvPrefix}, configFile)
+	if err != nil {
+		return nil, err
+	}
+	return buildConfigFromViper(v)
 }
 
 func (c *appConfig) title() string { return "Virtual Desktop — " + c.addr }
