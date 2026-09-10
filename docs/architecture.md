@@ -165,8 +165,9 @@ The decoder/session state machine enforces this matrix before dispatch. `ERROR` 
 
 Suggested module layout:
 
-- `cmd/vdhost`: flags/config, certificate and token loading, host assembly and signal handling.
-- `cmd/vdclient`: flags/config, trust pin loading, client UI assembly and signal handling.
+- `cmd/vdhost`: Cobra command, flags/config, certificate and token loading, host assembly and signal handling.
+- `cmd/vdclient`: Cobra command, flags/config, trust pin loading, client UI assembly and signal handling.
+- `internal/cliconfig`: shared Viper wiring used by both commands, giving every configuration value flag > environment variable (`VDHOST_*`/`VDCLIENT_*`) > YAML config file > default precedence. See the top-level README for the full precedence rules and example config files.
 - `internal/protocol`: constants, typed messages, framing, version negotiation, limits, direction/state validation; no OS or UI imports.
 - `internal/transport`: TLS configuration, dialing/listening, deadlines, connection read/write ownership, authentication.
 - `internal/session`: lifecycle state machine, cancellation, heartbeats, queues, host/client orchestration.
@@ -181,7 +182,7 @@ Suggested module layout:
 
 Native libraries and UI toolkit selection are implementation decisions only if they satisfy Linux amd64, cancellation, threading, licensing, and test-fake requirements. Protocol packages MUST NOT import native capture, injection, or UI packages. Interfaces belong with their consumers; adapters implement them. Commands contain wiring, not protocol logic.
 
-Configuration is explicit flags or a local config file. Environment variables may point to secret files but raw secret values should not be exposed in process listings. Logs use session-local random IDs and metadata, never pixel contents, key events, tokens, or certificate private data.
+Configuration is explicit flags, environment variables, or a local YAML config file, resolved via `internal/cliconfig` (Viper) with flag > environment variable > config file > default precedence. Environment variables may point to secret files but raw secret values should not be exposed in process listings. Logs use session-local random IDs and metadata, never pixel contents, key events, tokens, or certificate private data.
 
 ## 10. Implementation phases and dependencies
 
@@ -216,8 +217,9 @@ Repository-native verification commands should become:
 
 - `gofmt -w` on changed Go files and a clean formatting check in CI;
 - `go vet ./...`;
-- `go test ./...`;
-- `go test -race ./...`; and
+- `go test ./...` (unit tests use testify `assert`/`require` and mockery-generated mocks under `internal/*/mocks`; regenerate mocks with `go generate ./...` after an interface change);
+- `go test -race ./...`;
+- `./scripts/build.sh` (or `make build-all`) to cross-compile every release binary for all supported OS/arch pairs with the correct platform extension; and
 - protocol fuzz smoke runs with a fixed CI time budget.
 
 ## 12. Risks and mitigations
