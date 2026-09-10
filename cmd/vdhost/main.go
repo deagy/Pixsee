@@ -20,13 +20,27 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 
+	"virtualdesktop/internal/cliconfig"
 	"virtualdesktop/internal/host"
 	"virtualdesktop/internal/host/capture"
 	"virtualdesktop/internal/host/input"
 	"virtualdesktop/internal/protocol"
 	"virtualdesktop/internal/transport"
 )
+
+// configEnvPrefix is the prefix vdhost uses for configuration environment
+// variables: every flag is also settable as VDHOST_<FLAG_NAME>, upper-cased
+// with dashes turned into underscores (e.g. -capture-interval also reads
+// VDHOST_CAPTURE_INTERVAL). See internal/cliconfig for full precedence
+// rules (flag > env > config file > default).
+const configEnvPrefix = "VDHOST"
+
+// configFileName is the base name (without extension) vdhost looks for when
+// -config is not given, searched for as vdhost.yaml/.yml/.json/... in the
+// current directory, $HOME/.config/virtualdesktop, then /etc/virtualdesktop.
+const configFileName = "vdhost"
 
 // loadToken reads a 32-byte authentication token from a file. It accepts either
 // 32 raw bytes or 64 hexadecimal characters. An empty path yields the zero
@@ -101,29 +115,28 @@ func (e *flagError) Unwrap() error { return e.err }
 // and wires them into an appConfig identically to the pre-Cobra flag package
 // implementation, so existing flags, defaults, and behavior are unchanged.
 func newRootCmd() *cobra.Command {
-	var (
-		addr         string
-		tokenPath    string
-		caPath       string
-		keyPath      string
-		captureRate  time.Duration
-		keyframeRate time.Duration
-		maxInput     int
-		enableInput  bool
-		timeout      time.Duration
-	)
+	var configFile string
 
 	cmd := &cobra.Command{
 		Use:   "vdhost",
 		Short: "Virtual desktop host",
 		Long: "vdhost listens for TLS 1.3 clients, authenticates them with a 32-byte\n" +
 			"token, captures the desktop, and streams pixel updates while forwarding\n" +
-			"only keyboard and pointer input from the client.",
+			"only keyboard and pointer input from the client.\n\n" +
+			"Configuration values are resolved with the following precedence (highest\n" +
+			"first): command-line flag, environment variable (VDHOST_<FLAG_NAME>, e.g.\n" +
+			"VDHOST_ADDR or VDHOST_CAPTURE_INTERVAL), YAML config file (-config, or\n" +
+			"vdhost.yaml found in ., $HOME/.config/virtualdesktop, or\n" +
+			"/etc/virtualdesktop), then the flag's default.",
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := buildConfig(addr, tokenPath, caPath, keyPath, captureRate, keyframeRate, maxInput, enableInput, timeout)
+			v, err := cliconfig.New(cmd.Flags(), cliconfig.Options{ConfigName: configFileName, EnvPrefix: configEnvPrefix}, configFile)
+			if err != nil {
+				return &flagError{err}
+			}
+			cfg, err := buildConfigFromViper(v)
 			if err != nil {
 				return &flagError{err}
 			}
@@ -139,15 +152,16 @@ func newRootCmd() *cobra.Command {
 	})
 
 	fs := cmd.Flags()
-	fs.StringVar(&addr, "addr", "127.0.0.1:6511", "host:port to listen on")
-	fs.StringVar(&tokenPath, "token", "", "path to the 32-byte authentication token (raw or hex)")
-	fs.StringVar(&caPath, "ca", "", "path to a PEM certificate to serve as the host certificate")
-	fs.StringVar(&keyPath, "key", "", "path to the PEM private key matching -ca")
-	fs.DurationVar(&captureRate, "capture-interval", time.Second/30, "capture period")
-	fs.DurationVar(&keyframeRate, "keyframe-interval", 10*time.Second, "periodic keyframe period")
-	fs.IntVar(&maxInput, "max-input-per-sec", 500, "max input events per second")
-	fs.BoolVar(&enableInput, "enable-input", true, "accept client input events")
-	fs.DurationVar(&timeout, "timeout", 10*time.Second, "per-operation I/O deadline")
+	fs.StringVar(&configFile, "config", "", "path to a YAML config file (default: search for vdhost.yaml in ., $HOME/.config/virtualdesktop, /etc/virtualdesktop)")
+	fs.String("addr", "127.0.0.1:6511", "host:port to listen on")
+	fs.String("token", "", "path to the 32-byte authentication token (raw or hex)")
+	fs.String("ca", "", "path to a PEM certificate to serve as the host certificate")
+	fs.String("key", "", "path to the PEM private key matching -ca")
+	fs.Duration("capture-interval", time.Second/30, "capture period")
+	fs.Duration("keyframe-interval", 10*time.Second, "periodic keyframe period")
+	fs.Int("max-input-per-sec", 500, "max input events per second")
+	fs.Bool("enable-input", true, "accept client input events")
+	fs.Duration("timeout", 10*time.Second, "per-operation I/O deadline")
 
 	return cmd
 }
@@ -167,9 +181,20 @@ type appConfig struct {
 	ioTimeout        time.Duration
 }
 
-// buildConfig performs the same validation and defaulting the pre-Cobra
-// loadConfig used to perform, now over already-parsed flag values.
-func buildConfig(addr, tokenPath, caPath, keyPath string, captureRate, keyframeRate time.Duration, maxInput int, enableInput bool, timeout time.Duration) (*appConfig, error) {
+// buildConfigFromViper performs the same validation and defaulting the
+// pre-Cobra loadConfig used to perform, now reading already-resolved values
+// (flag > env > config file > default) from v.
+func buildConfigFromViper(v *viper.Viper) (*appConfig, error) {
+	addr := v.GetString("addr")
+	tokenPath := v.GetString("token")
+	caPath := v.GetString("ca")
+	keyPath := v.GetString("key")
+	captureRate := v.GetDuration("capture-interval")
+	keyframeRate := v.GetDuration("keyframe-interval")
+	maxInput := v.GetInt("max-input-per-sec")
+	enableInput := v.GetBool("enable-input")
+	timeout := v.GetDuration("timeout")
+
 	cfg := &appConfig{
 		addr:             addr,
 		captureInterval:  captureRate,
@@ -199,11 +224,12 @@ func buildConfig(addr, tokenPath, caPath, keyPath string, captureRate, keyframeR
 }
 
 // loadConfig retains the pre-Cobra entrypoint signature for callers (and
-// tests) that parse raw CLI args directly, without going through Cobra.
+// tests) that parse raw CLI args directly, without going through Cobra. It
+// still applies the full flag > env (VDHOST_*) > config file > default
+// precedence via internal/cliconfig.
 func loadConfig(args []string) (*appConfig, error) {
 	cmd := newRootCmd()
-	cmd.SetArgs(args)
-	var cfg *appConfig
+	cmd.SetArgs(normalizeArgs(args))
 	cmd.RunE = nil
 	fs := cmd.Flags()
 	if err := fs.Parse(normalizeArgs(args)); err != nil {
@@ -212,20 +238,12 @@ func loadConfig(args []string) (*appConfig, error) {
 	if err := cobra.NoArgs(cmd, fs.Args()); err != nil {
 		return nil, err
 	}
-	addr, _ := fs.GetString("addr")
-	tokenPath, _ := fs.GetString("token")
-	caPath, _ := fs.GetString("ca")
-	keyPath, _ := fs.GetString("key")
-	captureRate, _ := fs.GetDuration("capture-interval")
-	keyframeRate, _ := fs.GetDuration("keyframe-interval")
-	maxInput, _ := fs.GetInt("max-input-per-sec")
-	enableInput, _ := fs.GetBool("enable-input")
-	timeout, _ := fs.GetDuration("timeout")
-	cfg, err := buildConfig(addr, tokenPath, caPath, keyPath, captureRate, keyframeRate, maxInput, enableInput, timeout)
+	configFile, _ := fs.GetString("config")
+	v, err := cliconfig.New(fs, cliconfig.Options{ConfigName: configFileName, EnvPrefix: configEnvPrefix}, configFile)
 	if err != nil {
 		return nil, err
 	}
-	return cfg, nil
+	return buildConfigFromViper(v)
 }
 
 func buildTLSConfig(caPath, keyPath string) (*tls.Config, error) {

@@ -1,0 +1,22 @@
+# Example vdhost configuration file.
+#
+# vdhost looks for this file (named vdhost.yaml/.yml/.json/...) in, in
+# order: the current working directory, $HOME/.config/virtualdesktop, or
+# /etc/virtualdesktop — or you can point at an explicit file with -config.
+#
+# Precedence (highest wins): command-line flag > environment variable
+# (VDHOST_<FLAG_NAME>, e.g. VDHOST_ADDR, VDHOST_CAPTURE_INTERVAL) > this
+# config file > the flag's built-in default.
+#
+# Every key here matches a vdhost flag name; see `vdhost -h` for the full,
+# authoritative list and descriptions.
+
+addr: 127.0.0.1:6511
+# token: /etc/virtualdesktop/host.token
+# ca: /etc/virtualdesktop/host-cert.pem
+# key: /etc/virtualdesktop/host-key.pem
+capture-interval: 33ms
+keyframe-interval: 10s
+max-input-per-sec: 500
+enable-input: true
+timeout: 10s

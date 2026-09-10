@@ -1,0 +1,21 @@
+# Example vdclient configuration file.
+#
+# vdclient looks for this file (named vdclient.yaml/.yml/.json/...) in, in
+# order: the current working directory, $HOME/.config/virtualdesktop, or
+# /etc/virtualdesktop — or you can point at an explicit file with -config.
+#
+# Precedence (highest wins): command-line flag > environment variable
+# (VDCLIENT_<FLAG_NAME>, e.g. VDCLIENT_ADDR, VDCLIENT_ALLOW_INSECURE) > this
+# config file > the flag's built-in default.
+#
+# Every key here matches a vdclient flag name; see `vdclient -h` for the
+# full, authoritative list and descriptions.
+
+addr: localhost:6511
+# server-name: my-host.example.com
+# token: /etc/virtualdesktop/client.token
+# fingerprint: "de:ad:be:ef..."
+# ca: /etc/virtualdesktop/host-ca.pem
+allow-insecure: false
+timeout: 10s
+reconnect-delay: 1s
