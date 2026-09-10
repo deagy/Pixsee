@@ -1,0 +1,31 @@
+with-expecter: true
+dir: "{{.InterfaceDir}}/mocks"
+outpkg: "mocks"
+filename: "mock_{{.InterfaceName}}.go"
+mockname: "Mock{{.InterfaceName}}"
+resolve-type-alias: false
+disable-version-string: true
+issue-845-fix: true
+packages:
+  virtualdesktop/internal/host:
+    interfaces:
+      Capture:
+        config:
+          all: true
+      Input:
+        config:
+          all: true
+      Peer:
+        config:
+          all: true
+  virtualdesktop/internal/client:
+    interfaces:
+      Renderer:
+        config:
+          all: true
+      StateObserver:
+        config:
+          all: true
+      InputSender:
+        config:
+          all: true
