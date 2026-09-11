@@ -36,10 +36,12 @@ itself; releases are tagged in git).
 - **Cross-platform release build.** `scripts/build.sh` and a new
   `Makefile` (`make build-all`) cross-compile `vdhost`, `vdclient`,
   `e2e`, `captest`, and `rt` for all six supported OS/arch pairs
-  (linux/darwin/windows × amd64/arm64), naming each artifact with the
-  correct platform extension (`.exe` on Windows, none on Linux/macOS) and
-  writing a `dist/SHA256SUMS` checksum file. `make build` builds
-  host-platform-only binaries for local development.
+  (linux/darwin/windows × amd64/arm64), naming each artifact
+  `pixsee_<client|host|e2e|captest|rt>_<os>_<arch>[.exe]` (`.exe` on
+  Windows, no extension on Linux/macOS; e.g. `pixsee_host_linux_amd64`,
+  `pixsee_client_windows_arm64.exe`) and writing a `dist/SHA256SUMS`
+  checksum file. `make build` builds host-platform-only binaries for
+  local development, using the same naming scheme.
 
 ### Changed
 

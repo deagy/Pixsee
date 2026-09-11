@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
 # Cross-compiles the project's release binaries for every OS/arch pair in the
-# build matrix, naming each output with the platform-correct extension so the
+# build matrix, naming each output pixsee_<artifact>_<os>_<arch>[.exe] so the
 # artifact is directly runnable on its target OS (.exe on Windows, no
-# extension on Linux/macOS).
+# extension on Linux/macOS) and identifiable as a Pixsee release artifact.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${DIST_DIR:-$REPO_ROOT/dist}"
 
-# Binaries built and published as release artifacts.
+# Binaries built and published as release artifacts, mapped from their
+# ./cmd/<dir> source directory to the artifact name used in
+# pixsee_<artifact>_<os>_<arch>. vdhost/vdclient are the user-facing
+# host/client binaries; e2e/captest/rt are internal dev/test tools shipped
+# with the same naming scheme for consistency.
+declare -A ARTIFACT_NAMES=(
+  [vdhost]="host"
+  [vdclient]="client"
+  [e2e]="e2e"
+  [captest]="captest"
+  [rt]="rt"
+)
 CMDS=(vdhost vdclient e2e captest rt)
 
 # Supported OS/arch pairs. Keep in sync with docs/architecture.md and the
@@ -29,6 +40,7 @@ cd "$REPO_ROOT"
 
 fail=0
 for cmd in "${CMDS[@]}"; do
+  name="${ARTIFACT_NAMES[$cmd]}"
   for target in "${TARGETS[@]}"; do
     os="${target%% *}"
     arch="${target##* }"
@@ -40,7 +52,7 @@ for cmd in "${CMDS[@]}"; do
       ext=".exe"
     fi
 
-    out="$DIST_DIR/${cmd}_${os}_${arch}${ext}"
+    out="$DIST_DIR/pixsee_${name}_${os}_${arch}${ext}"
     echo "building ${cmd} ${os}/${arch} -> $(basename "$out")"
     if ! GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go build -o "$out" "./cmd/${cmd}/"; then
       echo "FAILED: ${cmd} ${os}/${arch}" >&2

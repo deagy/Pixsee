@@ -1,11 +1,11 @@
 # Build and test targets for the Virtual Desktop project.
 #
 # `make build-all` is the release build: it cross-compiles every binary for
-# every supported OS/arch pair and names each artifact with the correct
-# platform extension (.exe on Windows, none on Linux/macOS) via
-# scripts/build.sh. `make build` builds for the host platform only.
+# every supported OS/arch pair and names each artifact
+# pixsee_<artifact>_<os>_<arch>[.exe] (correct platform extension: .exe on
+# Windows, none on Linux/macOS) via scripts/build.sh. `make build` builds
+# for the host platform only, using the same naming scheme.
 
-BINARIES := vdhost vdclient e2e captest rt
 DIST_DIR := dist
 
 .PHONY: build build-all checksums test vet clean
@@ -14,9 +14,16 @@ build: ## Build all binaries for the host OS/arch (no cross-compilation)
 	@mkdir -p $(DIST_DIR)
 	@ext=""; \
 	if [ "$$(go env GOOS)" = "windows" ]; then ext=".exe"; fi; \
-	for bin in $(BINARIES); do \
-		echo "building $$bin$$ext"; \
-		go build -o $(DIST_DIR)/$$bin$$ext ./cmd/$$bin/ || exit 1; \
+	os="$$(go env GOOS)"; arch="$$(go env GOARCH)"; \
+	for bin in vdhost vdclient e2e captest rt; do \
+		case "$$bin" in \
+			vdhost) artifact=host ;; \
+			vdclient) artifact=client ;; \
+			*) artifact="$$bin" ;; \
+		esac; \
+		name="pixsee_$${artifact}_$${os}_$${arch}$$ext"; \
+		echo "building $$name"; \
+		go build -o $(DIST_DIR)/$$name ./cmd/$$bin/ || exit 1; \
 	done
 
 build-all: ## Cross-compile all binaries for every supported OS/arch (release build)
