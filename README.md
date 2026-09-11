@@ -37,14 +37,22 @@ make build          # host-platform binaries only, written to dist/
 
 `make build-all` (or `scripts/build.sh` directly) cross-compiles every
 binary — `vdhost`, `vdclient`, `e2e`, `captest`, `rt` — for every
-supported OS/arch pair and names each artifact with the
+supported OS/arch pair and names each artifact
+`pixsee_<client|host|e2e|captest|rt>_<os>_<arch>[.exe]`, matching the
 platform-appropriate extension:
 
-| OS      | Arch          | Extension |
-| ------- | ------------- | --------- |
-| linux   | amd64, arm64  | none      |
-| darwin  | amd64, arm64  | none      |
-| windows | amd64, arm64  | `.exe`    |
+| OS      | Arch  | Extension | Example (`vdhost`)              | Example (`vdclient`)              |
+| ------- | ----- | --------- | -------------------------------- | ----------------------------------- |
+| linux   | amd64 | none      | `pixsee_host_linux_amd64`        | `pixsee_client_linux_amd64`        |
+| linux   | arm64 | none      | `pixsee_host_linux_arm64`        | `pixsee_client_linux_arm64`        |
+| darwin  | amd64 | none      | `pixsee_host_darwin_amd64`       | `pixsee_client_darwin_amd64`       |
+| darwin  | arm64 | none      | `pixsee_host_darwin_arm64`       | `pixsee_client_darwin_arm64`       |
+| windows | amd64 | `.exe`    | `pixsee_host_windows_amd64.exe`  | `pixsee_client_windows_amd64.exe`  |
+| windows | arm64 | `.exe`    | `pixsee_host_windows_arm64.exe`  | `pixsee_client_windows_arm64.exe`  |
+
+The `e2e`, `captest`, and `rt` dev/test tools follow the same
+`pixsee_<name>_<os>_<arch>[.exe]` scheme (e.g. `pixsee_e2e_linux_amd64`,
+`pixsee_captest_windows_arm64.exe`, `pixsee_rt_darwin_arm64`).
 
 ```sh
 make build-all
@@ -52,11 +60,9 @@ make build-all
 ./scripts/build.sh
 ```
 
-Artifacts land in `dist/pixsee_<client|host|e2e|captest|rt>_<os>_<arch>[.exe]`
-(e.g. `dist/pixsee_host_linux_amd64`,
-`dist/pixsee_client_windows_amd64.exe`), built with `CGO_ENABLED=0`.
-`make checksums` (or the build script itself) writes a `dist/SHA256SUMS`
-file alongside them. `make clean` removes `dist/`.
+Artifacts land in `dist/`, built with `CGO_ENABLED=0`. `make checksums`
+(or the build script itself) writes a `dist/SHA256SUMS` file alongside
+them. `make clean` removes `dist/`.
 
 ## Running
 
@@ -127,6 +133,34 @@ timeout: 10s
 Run `vdhost --help` or `vdclient --help` for the authoritative, current
 list of flags, defaults, and descriptions — every config file key and
 environment variable name matches a flag name exactly.
+
+## Troubleshooting
+
+- **`config: While parsing config: yaml: control characters are not
+  allowed`** — this affected Windows builds (including Windows ARM64)
+  when a config file was created with a Windows tool that writes
+  non-UTF-8 text, e.g. PowerShell redirection (`>`) or `Set-Content`
+  without `-Encoding utf8`, or Notepad's legacy "Unicode" save option.
+  Those tools produce UTF-16 (with or without a byte-order mark), which
+  the YAML parser used to reject outright. `internal/cliconfig` now
+  detects and transcodes UTF-16/UTF-8-BOM config files (and strips stray
+  control bytes) before parsing, so this is fixed as of this release —
+  update to a build that includes the fix rather than re-encoding the
+  config file by hand. This never affected flags or environment
+  variables, only YAML config files.
+
+- **No client window appears, and the client repeatedly logs
+  `context deadline exceeded` while reconnecting** — this was caused by
+  `vdhost` never sending `SERVER_HELLO` after accepting a connection,
+  so the client sat in `Negotiating` until its wait timed out and it
+  retried forever with no display ever shown. It reproduced on every
+  platform, but was previously masked on Windows ARM64 by the YAML
+  parsing crash above (the client never got far enough to hit it). Fixed
+  as of this release — `vdhost` now completes the `CLIENT_HELLO`/
+  `SERVER_HELLO` negotiation before sending `DISPLAY_CONFIG`. If you see
+  this with a current build, check that the host and client binaries are
+  both from the same release (an old `vdhost` paired with a new
+  `vdclient`, or vice versa, can still exhibit protocol mismatches).
 
 ## Testing
 
