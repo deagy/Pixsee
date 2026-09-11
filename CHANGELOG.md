@@ -43,6 +43,34 @@ itself; releases are tagged in git).
   checksum file. `make build` builds host-platform-only binaries for
   local development, using the same naming scheme.
 
+### Fixed
+
+- **Windows ARM64 config parsing crash.** `vdhost`/`vdclient` failed to
+  start on Windows (including ARM64) with
+  `config: While parsing config: yaml: control characters are not
+  allowed` when the YAML config file was written by a tool that emits
+  UTF-16 or a UTF-8 byte-order mark (PowerShell redirection/`Set-Content`
+  without `-Encoding utf8`, Notepad's legacy "Unicode" save option, or
+  similar). `internal/cliconfig` now detects and transcodes UTF-16
+  (with or without BOM) and UTF-8-BOM config files, and strips stray
+  disallowed control bytes, before handing the bytes to the YAML parser.
+  A clean UTF-8 file is left byte-for-byte unchanged. Covered by
+  `internal/cliconfig/cliconfig_windows_encoding_test.go`.
+- **Missing GUI and continuous error spam connecting to a host.**
+  `vdhost` accepted a client's TLS handshake and token but then invoked
+  the session service directly without exchanging `CLIENT_HELLO`/
+  `SERVER_HELLO` first. The client's session state machine (`Negotiating`)
+  rejects any `DISPLAY_CONFIG` sent before that exchange, so every
+  connection was torn down immediately after authentication; the client
+  never saw a display and looped forever on `context deadline exceeded`
+  reconnect attempts with no window and continuous stderr error spam.
+  This affected every platform, but was only observed after the Windows
+  ARM64 config-parsing crash above was fixed and a host/client on that
+  platform could actually reach the connect step. `vdhost` now completes
+  the `CLIENT_HELLO`/`SERVER_HELLO` negotiation before sending
+  `DISPLAY_CONFIG`, matching what the client already expects. Covered by
+  a new regression test in `cmd/vdhost/handle_connection_test.go`.
+
 ### Changed
 
 - README rewritten to document the new CLI, configuration, testing, and
