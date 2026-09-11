@@ -325,6 +325,37 @@ func handleConnection(ctx context.Context, cfg *appConfig, conn net.Conn) {
 	}
 	fmt.Printf("vdhost: client authenticated from %s\n", conn.RemoteAddr())
 
+	// Negotiating: the client sends CLIENT_HELLO and the host replies with
+	// SERVER_HELLO before any DISPLAY_CONFIG/FRAME traffic. Without this
+	// exchange the peer's session state machine stays in the Negotiating
+	// state and rejects the service's first DISPLAY_CONFIG send as invalid
+	// for the current state, closing the connection; the client then times
+	// out waiting for SERVER_HELLO and reconnects forever with no display
+	// ever appearing. See docs/architecture.md sections 5 and 8.
+	message, err := peer.Receive(ctx)
+	if err != nil {
+		_ = conn.Close()
+		fmt.Fprintf(os.Stderr, "vdhost: hello: %v\n", err)
+		return
+	}
+	hello, ok := message.(protocol.ClientHello)
+	if !ok {
+		_ = conn.Close()
+		fmt.Fprintf(os.Stderr, "vdhost: hello: expected CLIENT_HELLO, got %T\n", message)
+		return
+	}
+	version, err := protocol.NegotiateVersion(hello.MinVersion, hello.MaxVersion, protocol.Version1, protocol.Version1)
+	if err != nil {
+		_ = conn.Close()
+		fmt.Fprintf(os.Stderr, "vdhost: version negotiation: %v\n", err)
+		return
+	}
+	if err := peer.Send(ctx, protocol.ServerHello{Version: version}); err != nil {
+		_ = conn.Close()
+		fmt.Fprintf(os.Stderr, "vdhost: hello: %v\n", err)
+		return
+	}
+
 	input, err := cfg.input()
 	if err != nil {
 		_ = conn.Close()
