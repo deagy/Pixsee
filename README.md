@@ -52,27 +52,28 @@ make build-all
 ./scripts/build.sh
 ```
 
-Artifacts land in `dist/<binary>_<os>_<arch>[.exe]` (e.g.
-`dist/vdhost_linux_amd64`, `dist/vdclient_windows_amd64.exe`), built with
-`CGO_ENABLED=0`. `make checksums` (or the build script itself) writes a
-`dist/SHA256SUMS` file alongside them. `make clean` removes `dist/`.
+Artifacts land in `dist/pixsee_<client|host|e2e|captest|rt>_<os>_<arch>[.exe]`
+(e.g. `dist/pixsee_host_linux_amd64`,
+`dist/pixsee_client_windows_amd64.exe`), built with `CGO_ENABLED=0`.
+`make checksums` (or the build script itself) writes a `dist/SHA256SUMS`
+file alongside them. `make clean` removes `dist/`.
 
 ## Running
 
 ```sh
 # Host: listen on the default address, require a 32-byte token file.
-./dist/vdhost --token /path/to/host.token --ca cert.pem --key key.pem
+./dist/pixsee_host_linux_amd64 --token /path/to/host.token --ca cert.pem --key key.pem
 
 # Client: connect, pinning the host's CA.
-./dist/vdclient --addr host:6511 --token /path/to/client.token --ca ca.pem
+./dist/pixsee_client_linux_amd64 --addr host:6511 --token /path/to/client.token --ca ca.pem
 ```
 
 Both commands print Cobra-generated `--help` output listing every flag,
 its default, and a short description:
 
 ```sh
-./dist/vdhost --help
-./dist/vdclient --help
+./dist/pixsee_host_linux_amd64 --help
+./dist/pixsee_client_linux_amd64 --help
 ```
 
 Single-dash long flags (e.g. `-addr`) are still accepted for compatibility
