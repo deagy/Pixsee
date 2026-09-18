@@ -90,7 +90,20 @@ single-character flags (e.g. `-h`) are unaffected.
 host started without `--token` accepts any non-zero client token, and a
 client started without `--token` mints a random one. A warning is printed
 to stderr in this mode — see `docs/architecture.md` for the security
-implications.
+implications. The same kind of loud stderr warning is printed when
+`--allow-insecure` is set, since it disables host certificate verification
+and must never be used against an untrusted host on a real network.
+
+`vdclient` accepts a `--connect-timeout` (default `0` = no limit) that
+bounds the whole initial connect sequence — dial, TLS handshake,
+authentication, and `CLIENT_HELLO`/`SERVER_HELLO` negotiation — across
+reconnect attempts. When it is exhausted the client returns an error
+instead of reconnecting forever against a dead host.
+
+`vdhost` admits exactly one active client session at a time. A second
+client that authenticates is rejected with a busy protocol error and
+closed, rather than being served a stale or interleaved view of the
+host's display.
 
 ## Configuration
 
@@ -165,6 +178,13 @@ environment variable name matches a flag name exactly.
   this with a current build, check that the host and client binaries are
   both from the same release (an old `vdhost` paired with a new
   `vdclient`, or vice versa, can still exhibit protocol mismatches).
+
+- **A second `vdclient` connects but sees no display (or the client
+  exits with a busy error)** — `vdhost` admits exactly one active client
+  session at a time. A second client that authenticates is rejected with
+  a `busy` protocol error and closed before it can receive any frames.
+  This is normal: only one client can view the host's display. Connect a
+  different client, or close the first one before connecting another.
 
 ## Testing
 

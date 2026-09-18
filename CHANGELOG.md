@@ -27,6 +27,40 @@ itself; releases are tagged in git).
   actually loaded (including when found via the default search) plus
   the first disallowed character, its line/column and byte offset.
   Covered by `internal/cliconfig/cliconfig_windows_c1_encoding_test.go`.
+- **Second client leaked a goroutine and a listener slot.** `vdhost`
+  accepted every authenticated connection, so a second client
+  authenticated, blocked forever reading `CLIENT_HELLO`, and never
+  released its resources. `vdhost` now admits exactly one active client
+  session: a second authenticated connection is rejected with
+  `ERROR_BUSY` and closed before entering the service loop.
+- **No keyframe recovery or heartbeat.** The host ignored the client's
+  `KEYFRAME_REQUEST`, so a client that could not apply a delta ended its
+  session instead of resynchronizing, and neither side exchanged
+  `PING`/`PONG` to detect a dead peer. `internal/host` now handles
+  `KEYFRAME_REQUEST` by forcing the next visual update to be a
+  keyframe, sends `PING` after idle, and answers incoming `PING` with
+  `PONG`; an unhandled control message no longer silently ends the
+  session.
+- **Client could hang forever against a dead host.** `vdclient` gained a
+  `--connect-timeout` (default `0` = no limit) that bounds the whole
+  initial connect sequence — dial, TLS handshake, authentication, and
+  `CLIENT_HELLO`/`SERVER_HELLO` negotiation — across reconnect attempts.
+  When it is exhausted the client returns an error instead of
+  reconnecting forever.
+- **No startup warning for `-allow-insecure`.** `vdclient` now prints a
+  loud stderr warning when host certificate verification is disabled,
+  mirroring the tokenless-mode warning.
+- **Wheel-delta bound mismatch between protocol validation and host
+  injection.** `internal/protocol` and `internal/host/input` now agree on
+  the maximum wheel delta; the bound is asserted by
+  `TestWheelDeltaBound` so validation and injection cannot drift apart.
+
+### Docs
+
+- README documents the single-session guard, the `-allow-insecure`
+  startup warning, `--connect-timeout`, and a troubleshooting entry for
+  the busy error; CHANGELOG records the second-round Windows ARM64
+  config fix and the host/client hardening fixes above.
 
 ## v1.3.1 - 2026-09-11
 
