@@ -12,9 +12,10 @@ import (
 )
 
 var (
-	ErrInvalidInput  = errors.New("invalid host input")
-	ErrInputDisabled = fmt.Errorf("%w: input is disabled", ErrInvalidInput)
-	ErrInputRate     = fmt.Errorf("%w: rate limit exceeded", ErrInvalidInput)
+	ErrInvalidInput       = errors.New("invalid host input")
+	ErrInputDisabled      = fmt.Errorf("%w: input is disabled", ErrInvalidInput)
+	ErrInputRate          = fmt.Errorf("%w: rate limit exceeded", ErrInvalidInput)
+	ErrHeartbeatTimeout   = errors.New("no response to heartbeat")
 )
 
 type Capture interface {
@@ -41,6 +42,12 @@ type Config struct {
 	MaxInputEventsPerSecond int
 	EnableInput             bool
 	Damage                  damage.Config
+	// HeartbeatInterval is how long the idle host waits before sending a
+	// PING probe to a connected client; HeartbeatTimeout is how long the host
+	// waits for a PONG (or any message) after the last activity before it
+	// treats the session as gone. Both default to 30s when zero.
+	HeartbeatInterval time.Duration
+	HeartbeatTimeout  time.Duration
 }
 
 type Service struct {
@@ -54,6 +61,16 @@ type Service struct {
 	lastInputSeq    uint64
 	rateWindowStart time.Time
 	rateCount       int
+	// keyframeRequested is set when the client sends a KEYFRAME_REQUEST (it
+	// received a delta it could not apply) and cleared the next time the send
+	// loop processes a capture, forcing that capture to be a full keyframe so
+	// the client can resynchronize instead of ending the session.
+	keyframeRequested bool
+	// pingNonce is a monotonic heartbeat nonce so each PING is distinguishable.
+	pingNonce uint64
+	// lastActivity is the last time any message arrived from the client; the
+	// heartbeat loop uses it to decide when to probe and when to give up.
+	lastActivity time.Time
 }
 
 func NewService(config Config, capture Capture, input Input) *Service {
@@ -68,6 +85,15 @@ func NewService(config Config, capture Capture, input Input) *Service {
 	}
 	if config.MaxInputEventsPerSecond <= 0 {
 		config.MaxInputEventsPerSecond = 500
+	}
+	// Default heartbeat cadence follows docs/architecture.md: a probe ping is
+	// sent after an idle period and a silent peer is treated as gone once the
+	// heartbeat timeout elapses.
+	if config.HeartbeatInterval <= 0 {
+		config.HeartbeatInterval = 30 * time.Second
+	}
+	if config.HeartbeatTimeout <= 0 {
+		config.HeartbeatTimeout = 30 * time.Second
 	}
 	return &Service{config: config, capture: capture, input: input}
 }
@@ -85,16 +111,20 @@ func (s *Service) Run(ctx context.Context, peer Peer) error {
 	if lastKeyframe, err = s.sendCapture(ctx, peer, detector, image, true, lastKeyframe); err != nil {
 		return err
 	}
+	// Seed the heartbeat's activity clock so the first probe fires only after
+	// a full HeartbeatInterval of idle, not immediately on the zero time.
+	s.recordActivity()
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer func() { _ = s.input.ReleaseAll(context.WithoutCancel(ctx)) }()
 
 	captures := make(chan damage.Image, 1)
-	errs := make(chan error, 3)
+	errs := make(chan error, 4)
 	go s.captureLoop(runCtx, captures, errs)
 	go s.sendLoop(runCtx, peer, detector, captures, lastKeyframe, errs)
 	go s.inputLoop(runCtx, peer, errs)
+	go s.heartbeatLoop(runCtx, peer, errs)
 
 	select {
 	case <-ctx.Done():
@@ -153,6 +183,16 @@ func (s *Service) sendLoop(ctx context.Context, peer Peer, detector *damage.Dete
 }
 
 func (s *Service) sendCapture(ctx context.Context, peer Peer, detector *damage.Detector, image damage.Image, force bool, lastKeyframe time.Time) (time.Time, error) {
+	// Honor a pending KEYFRAME_REQUEST: the client asked to resynchronize (it
+	// could not apply a delta), so force the next visual update to a full
+	// keyframe so it can catch up instead of ending the session. This must be
+	// folded into force before the single detector.Compare call below, which
+	// advances the detector's generation/sequence and has side effects.
+	s.mu.Lock()
+	force = force || s.keyframeRequested
+	s.keyframeRequested = false
+	s.mu.Unlock()
+
 	frame, changed, err := detector.Compare(image, force)
 	if err != nil {
 		return lastKeyframe, fmt.Errorf("process capture: %w", err)
@@ -190,14 +230,83 @@ func (s *Service) inputLoop(ctx context.Context, peer Peer, errs chan<- error) {
 			report(errs, err)
 			return
 		}
-		if err := s.handleInput(ctx, message); err != nil {
+		s.recordActivity()
+		if err := s.handleInput(ctx, peer, message); err != nil {
 			report(errs, err)
 			return
 		}
 	}
 }
 
-func (s *Service) handleInput(ctx context.Context, message protocol.Message) error {
+// recordActivity stamps the last time any message arrived so the heartbeat
+// loop can tell a responsive peer from a silent one.
+func (s *Service) recordActivity() {
+	s.mu.Lock()
+	s.lastActivity = time.Now()
+	s.mu.Unlock()
+}
+
+// heartbeatLoop implements the idle-session watchdog described in
+// docs/architecture.md: after HeartbeatInterval of inactivity the host probes
+// the client with a PING; if no message (PING, PONG, or otherwise) arrives
+// within HeartbeatTimeout the session is treated as gone.
+func (s *Service) heartbeatLoop(ctx context.Context, peer Peer, errs chan<- error) {
+	ticker := time.NewTicker(s.config.HeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			elapsed := time.Since(s.lastActivity)
+			s.mu.Unlock()
+			if elapsed >= s.config.HeartbeatTimeout {
+				report(errs, ErrHeartbeatTimeout)
+				return
+			}
+			if elapsed >= s.config.HeartbeatInterval {
+				s.mu.Lock()
+				s.pingNonce++
+				nonce := s.pingNonce
+				s.mu.Unlock()
+				if err := peer.Send(ctx, protocol.Ping{Nonce: nonce}); err != nil {
+					report(errs, err)
+					return
+				}
+			}
+		}
+	}
+}
+
+func (s *Service) handleInput(ctx context.Context, peer Peer, message protocol.Message) error {
+	// Control messages the client may send. They are not input events: they
+	// carry no input header and must not be rate limited or fall through to
+	// the input handlers. An unhandled control message is a protocol error;
+	// anything else in this list is handled below so a stray control message
+	// does not silently end the session.
+	switch v := message.(type) {
+	case protocol.KeyframeRequest:
+		// The client received a delta it could not apply and asked to
+		// resynchronize. Mark that the next visual update must be a full
+		// keyframe so it can catch up; the send loop clears the flag.
+		s.mu.Lock()
+		s.keyframeRequested = true
+		s.mu.Unlock()
+		return nil
+	case protocol.Ping:
+		// Respond to a client heartbeat probe; the client uses this to keep
+		// the session alive and detect a dead host.
+		if err := peer.Send(ctx, protocol.Pong{Nonce: v.Nonce}); err != nil {
+			return err
+		}
+		return nil
+	case protocol.Pong:
+		// A client answered one of our probes; treat it as activity.
+		s.recordActivity()
+		return nil
+	}
+
 	if !s.config.EnableInput {
 		return ErrInputDisabled
 	}

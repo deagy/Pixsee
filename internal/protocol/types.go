@@ -13,6 +13,14 @@ const (
 	MaxPixelPayloadHard   = uint32(16 << 20)
 	MaxRectanglesHard     = uint16(256)
 	MaxDimensionHard      = uint32(8192)
+	// MaxWheelClicks is the largest wheel detent count a single PointerWheel
+	// event may request (delta / 120). The protocol validation below clamps
+	// the wheel delta to this bound so the host's input injector — which is
+	// the only place a delta is actually replayed — can never reject a
+	// message the wire accepted. Keeping the single source of truth here
+	// (rather than duplicated in the input package) means validation and
+	// injection cannot drift apart.
+	MaxWheelClicks = 20
 )
 
 var (

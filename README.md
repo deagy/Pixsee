@@ -137,16 +137,20 @@ environment variable name matches a flag name exactly.
 ## Troubleshooting
 
 - **`config: While parsing config: yaml: control characters are not
-  allowed`** — this affected Windows builds (including Windows ARM64)
-  when a config file was created with a Windows tool that writes
-  non-UTF-8 text, e.g. PowerShell redirection (`>`) or `Set-Content`
-  without `-Encoding utf8`, or Notepad's legacy "Unicode" save option.
-  Those tools produce UTF-16 (with or without a byte-order mark), which
-  the YAML parser used to reject outright. `internal/cliconfig` now
-  detects and transcodes UTF-16/UTF-8-BOM config files (and strips stray
-  control bytes) before parsing, so this is fixed as of this release —
-  update to a build that includes the fix rather than re-encoding the
-  config file by hand. This never affected flags or environment
+  allowed`** — the YAML config file contains characters the YAML parser
+  refuses: NUL/C0 control bytes, DEL, the C1 range U+0080–U+009F,
+  surrogates or U+FFFE/U+FFFF. On Windows (including ARM64) this comes
+  from tools that re-encode text: PowerShell redirection (`>`) or
+  `Set-Content` without `-Encoding utf8` produce UTF-16, Notepad's legacy
+  "Unicode"/"ANSI" options, and Latin-1 mis-decodes (PowerShell 5.1
+  `Invoke-WebRequest`, some editors) that turn a multi-byte character
+  such as an em-dash into C1 controls. `internal/cliconfig` transcodes
+  UTF-16/UTF-8-BOM files and strips every character the parser refuses
+  before parsing, so current builds load such files. If a file still
+  fails, the error names the file that was loaded and the first
+  offending character with its line, column and byte offset; inspect
+  that spot with `Format-Hex <file>` (PowerShell) or `xxd` and re-save
+  the file as plain UTF-8. This never affected flags or environment
   variables, only YAML config files.
 
 - **No client window appears, and the client repeatedly logs
@@ -174,6 +178,13 @@ make test
 
 `go vet ./...` (or `make vet`) is also part of the standard pre-commit
 check.
+
+Continuous integration runs the same gates on every push and pull request in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml): a `gofmt` formatting
+check, `go vet`, unit tests split so the RSA-2048 client handshake tests do not
+hold up the rest of the suite, a `-race` gate on the fast packages, the
+integration suite, a fixed-budget protocol fuzz smoke run, and a
+cross-compile of every release binary.
 
 Unit tests use [testify](https://github.com/stretchr/testify) (`assert`
 and `require`) for assertions, and [mockery](https://github.com/vektra/mockery)-generated

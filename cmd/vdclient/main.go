@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
 	"virtualdesktop/internal/cliconfig"
@@ -111,7 +112,7 @@ func newRootCmd() *cobra.Command {
 			if err != nil {
 				return &flagError{err}
 			}
-			cfg, err := buildConfigFromViper(v)
+			cfg, err := buildConfigFromViper(v, cmd.Flags())
 			if err != nil {
 				return &flagError{err}
 			}
@@ -136,6 +137,7 @@ func newRootCmd() *cobra.Command {
 	fs.Bool("allow-insecure", false, "skip host certificate verification (use only with self-signed/untrusted hosts)")
 	fs.Duration("timeout", 10*time.Second, "per-operation I/O deadline")
 	fs.Duration("reconnect-delay", time.Second, "delay before a reconnect attempt")
+	fs.Duration("connect-timeout", 0, "overall deadline for the initial connect sequence (0 = no limit)")
 
 	return cmd
 }
@@ -148,12 +150,13 @@ type appConfig struct {
 	Dial           func(context.Context) (net.Conn, error)
 	ioTimeout      time.Duration
 	reconnectDelay time.Duration
+	connectTimeout time.Duration
 }
 
 // buildConfigFromViper performs the same validation and defaulting the
 // pre-Cobra loadConfig used to perform, now reading already-resolved values
 // (flag > env > config file > default) from v.
-func buildConfigFromViper(v *viper.Viper) (*appConfig, error) {
+func buildConfigFromViper(v *viper.Viper, fs *pflag.FlagSet) (*appConfig, error) {
 	addr := v.GetString("addr")
 	serverName := v.GetString("server-name")
 	tokenPath := v.GetString("token")
@@ -162,7 +165,15 @@ func buildConfigFromViper(v *viper.Viper) (*appConfig, error) {
 	allowInsecure := v.GetBool("allow-insecure")
 	timeout := v.GetDuration("timeout")
 	reconnect := v.GetDuration("reconnect-delay")
+	connectTimeout := v.GetDuration("connect-timeout")
 
+	// Viper returns "" for a string flag that was never explicitly set, even
+	// though pflag has a default, so the hard check below would fire on a
+	// plain `vdclient` with no -addr. Fall back to the flag's default, which
+	// is what fs.GetString would return.
+	if addr == "" {
+		addr, _ = fs.GetString("addr")
+	}
 	if addr == "" {
 		return nil, errors.New("client: -addr is required")
 	}
@@ -184,6 +195,14 @@ func buildConfigFromViper(v *viper.Viper) (*appConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	if allowInsecure {
+		// -allow-insecure disables host certificate verification. It is
+		// intended only for lab/isolated hosts with self-signed
+		// certificates; against an untrusted host on a real network it lets
+		// an attacker impersonate the host with a certificate the client
+		// has never seen. Warn so an accidental production use is loud.
+		fmt.Fprintln(os.Stderr, "vdclient: WARNING: -allow-insecure disables host certificate verification; use only against trusted lab hosts, never on an untrusted network")
+	}
 	return &appConfig{
 		addr:           addr,
 		serverName:     serverName,
@@ -191,6 +210,7 @@ func buildConfigFromViper(v *viper.Viper) (*appConfig, error) {
 		tlsConfig:      tlsConfig,
 		ioTimeout:      timeout,
 		reconnectDelay: reconnect,
+		connectTimeout: connectTimeout,
 	}, nil
 }
 
@@ -213,7 +233,7 @@ func loadConfig(args []string) (*appConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	return buildConfigFromViper(v)
+	return buildConfigFromViper(v, fs)
 }
 
 func (c *appConfig) title() string { return "Virtual Desktop — " + c.addr }
@@ -285,6 +305,7 @@ func run(cfg *appConfig) error {
 		TLSConfig:      cfg.tlsConfig,
 		IOTimeout:      cfg.ioTimeout,
 		ReconnectDelay: cfg.reconnectDelay,
+		ConnectTimeout: cfg.connectTimeout,
 		Dial:           cfg.Dial,
 		Input:          input,
 	}, host, observer)

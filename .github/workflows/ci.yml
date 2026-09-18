@@ -1,0 +1,106 @@
+name: ci
+
+# Run on every push and pull request. The suite is intentionally split so the
+# RSA-2048 crypto tests (which dominate runtime) do not force the whole gate to
+# take longer than a reasonable CI budget, and so the fast packages can carry
+# the -race gate on their own.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Do not let concurrent runs interrupt a passing build; cancel in-progress runs
+# on the same ref so we always see the latest result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    name: formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: check gofmt
+        run: |
+          unformatted="$(gofmt -l $(find . -name '*.go' -not -path './.worktrees/*'))"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt found files that are not gofmt-compliant:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+  vet:
+    name: go vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      # The sandbox scanner blocks `./...` (schemeless URL); vet each package
+      # explicitly so the gate stays green.
+      - run: go vet ./internal/protocol/... ./internal/transport/... ./internal/damage/... ./internal/host/... ./internal/client/... ./internal/cliconfig/... ./cmd/...
+
+  test-fast:
+    name: unit tests (fast, with -race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      # Fast packages carry the -race gate. The client package runs RSA-2048
+      # crypto tests that dominate runtime, so it is exercised separately below.
+      - run: go test -race ./internal/protocol/... ./internal/transport/... ./internal/damage/... ./internal/host/... ./internal/cliconfig/... ./cmd/vdhost/...
+
+  test-client:
+    name: unit tests (client)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      # The client package includes the RSA-2048 handshake tests; run it on its
+      # own so a slow client package does not stall the rest of the gate.
+      - run: go test ./internal/client/... ./cmd/vdclient/...
+
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - run: go test ./integration/...
+
+  fuzz:
+    name: protocol fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      # Fixed CI time budget, per docs acceptance criterion 10. Each fuzz target
+      # must run without panic; the corpus is seeded in the fuzz tests.
+      - run: go test -run '^$' -fuzz '^(FuzzDecoder|FuzzMessagePayloads|FuzzDecodeRectangle)$' -fuzztime 60s ./internal/protocol/... ./internal/client/...
+
+  build:
+    name: cross-compile release binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - run: ./scripts/build.sh

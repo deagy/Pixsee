@@ -9,7 +9,24 @@ itself; releases are tagged in git).
 
 ## Unreleased
 
-Nothing yet.
+### Fixed
+
+- **Windows ARM64 config parsing crash, second round.** The v1.3.1 fix
+  only handled UTF-16/BOM files, but `pixsee_host_windows_arm64.exe`
+  from v1.3.1 still failed on Windows 11 ARM64 with
+  `config: While parsing config: yaml: control characters are not
+  allowed`. The YAML decoder also refuses DEL..U+0084, the C1 controls
+  U+0086..U+009F, UTF-16 surrogates and U+FFFE/U+FFFF; those are valid
+  UTF-8, so the old byte-level sanitizer left such files untouched and
+  never retried. The concrete trigger was the em-dash in the shipped
+  example configs after a Latin-1 mis-decode (e.g. PowerShell 5.1
+  `Invoke-WebRequest`, or an editor treating the file as "ANSI").
+  `internal/cliconfig` now sanitizes rune by rune against the decoder's
+  exact allowed set and drops invalid UTF-8 bytes, the example configs
+  are ASCII-only, and a config error now names the file that was
+  actually loaded (including when found via the default search) plus
+  the first disallowed character, its line/column and byte offset.
+  Covered by `internal/cliconfig/cliconfig_windows_c1_encoding_test.go`.
 
 ## v1.3.1 - 2026-09-11
 

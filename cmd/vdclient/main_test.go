@@ -7,8 +7,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"io"
 	"math/big"
 	"net"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,6 +104,39 @@ func TestBuildTLSConfigBadFingerprint(t *testing.T) {
 	_, err := buildTLSConfig("", "localhost:6511", "not-hex", "", false)
 	if err == nil {
 		t.Fatal("expected error for bad fingerprint")
+	}
+}
+
+// TestAllowInsecureEmitsStartupWarning proves the loud warning the client
+// prints when -allow-insecure disables host certificate verification, so an
+// accidental production use is visible on stderr.
+func TestAllowInsecureEmitsStartupWarning(t *testing.T) {
+	var fp [32]byte
+	_, _ = rand.Read(fp[:])
+
+	// Capture whatever the client writes to stderr while building config.
+	origStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+
+	cfg, err := loadConfig([]string{
+		"-addr", "example.com:6511",
+		"-allow-insecure",
+		"-fingerprint", hexString(fp),
+	})
+
+	w.Close()
+	os.Stderr = origStderr
+	out, _ := io.ReadAll(r)
+
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if !cfg.tlsConfig.InsecureSkipVerify {
+		t.Fatal("expected InsecureSkipVerify when -allow-insecure is set")
+	}
+	if !strings.Contains(string(out), "WARNING") || !strings.Contains(string(out), "allow-insecure") {
+		t.Fatalf("expected a warning mentioning -allow-insecure on stderr, got %q", string(out))
 	}
 }
 

@@ -89,3 +89,32 @@ func compressedPayload(t *testing.T, p []byte) []byte {
 	}
 	return b.Bytes()
 }
+
+// FuzzDecodeRectangle feeds the zlib framebuffer decoder random bytes so the
+// adversarial zlib path — over-decompression, truncation, malformed streams,
+// and expansion-bomb payloads — is exercised without panicking or leaking.
+// decodeRectangle bounds the decoded length to the rectangle's pixel count, so
+// every input must either decode to exactly the expected length or return an
+// error; a panic here is a real crash.
+func FuzzDecodeRectangle(f *testing.F) {
+	limits := protocol.DefaultLimits()
+	// A valid zlib rectangle to seed the corpus.
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	_, _ = zw.Write(pixels(4, 1))
+	_ = zw.Close()
+	f.Add(uint32(2), uint32(2), compressed.Bytes())
+	f.Fuzz(func(t *testing.T, width, height uint32, raw []byte) {
+		rect := protocol.Rectangle{Width: width, Height: height, Encoding: protocol.EncodingZlibBGRA, Pixels: raw}
+		// A rectangle whose pixel payload exceeds the hard cap is rejected
+		// before any allocation, so skip it rather than treat it as an
+		// interesting fuzz input.
+		if uint64(width)*uint64(height)*4 > uint64(protocol.MaxPixelPayloadHard) {
+			return
+		}
+		// decodeRectangle must never panic on adversarial zlib input; it
+		// either returns the exact expected byte count or a non-nil error.
+		// The existing unit test already asserts the success/error contract.
+		_, _ = decodeRectangle(rect, limits)
+	})
+}

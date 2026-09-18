@@ -207,7 +207,30 @@ func TestInputValidation(t *testing.T) {
 	}
 }
 
+// TestWheelDeltaBound enforces the single wheel-delta bound in
+// ValidateMessage: the total detents requested across both axes (delta / 120)
+// must not exceed MaxWheelClicks. This is the protocol-level half of the
+// input.go wheelClicks cap, so validation and injection cannot drift apart.
+func TestWheelDeltaBound(t *testing.T) {
+	// Exactly at the bound (20 detents total) is accepted.
+	if err := ValidateMessage(PointerWheel{Generation: 1, InputSequence: 1, Horizontal: 120 * 20}, DefaultLimits()); err != nil {
+		t.Fatalf("accepted wheel at bound: %v", err)
+	}
+	// One over the bound (21 detents total) is rejected.
+	if err := ValidateMessage(PointerWheel{Generation: 1, InputSequence: 1, Horizontal: 120 * 21}, DefaultLimits()); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("rejected wheel over bound: %v", err)
+	}
+	// The bound is summed across both axes: 20 vertical + 1 horizontal is
+	// over, even though neither axis alone exceeds it.
+	if err := ValidateMessage(PointerWheel{Generation: 1, InputSequence: 1, Vertical: 120 * 20, Horizontal: 120}, DefaultLimits()); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("rejected wheel summed across axes: %v", err)
+	}
+}
+
 func TestSessionStateValidation(t *testing.T) {
+	// The wheel bound is enforced once, in ValidateMessage (see
+	// TestWheelDeltaBound). This guards the state machine, not the input
+	// message bounds.
 	if err := ValidateState(StateAuthenticating, Auth{Version: Version1}); err != nil {
 		t.Fatal(err)
 	}
