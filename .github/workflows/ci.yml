@@ -93,7 +93,16 @@ jobs:
           go-version: '1.25'
       # Fixed CI time budget, per docs acceptance criterion 10. Each fuzz target
       # must run without panic; the corpus is seeded in the fuzz tests.
-      - run: go test -run '^$' -fuzz '^(FuzzDecoder|FuzzMessagePayloads|FuzzDecodeRectangle)$' -fuzztime 60s ./internal/protocol/... ./internal/client/...
+      # Go forbids `-fuzz` across multiple packages and forbids a `-fuzz`
+      # pattern that matches more than one target within a package, so each
+      # individual fuzz target runs on its own line:
+      #   protocol: FuzzDecoder, FuzzMessagePayloads
+      #   client:   FuzzDecodeRectangle
+      - run: go test -run '^$' -fuzz '^FuzzDecoder$' -fuzztime 20s ./internal/protocol/...
+      - run: go test -run '^$' -fuzz '^FuzzMessagePayloads$' -fuzztime 20s ./internal/protocol/...
+      # Use the exact package path (not ./internal/client/...) so the fuzz run
+      # targets only the client package and not the mocks subpackage.
+      - run: go test -run '^$' -fuzz '^FuzzDecodeRectangle$' -fuzztime 20s ./internal/client
 
   build:
     name: cross-compile release binaries
