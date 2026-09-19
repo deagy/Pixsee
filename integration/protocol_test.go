@@ -200,7 +200,7 @@ func TestOversizedFrameRejected(t *testing.T) {
 	copy(buf[0:4], protocol.Magic)
 	binary.BigEndian.PutUint16(buf[4:6], protocol.Version1)
 	binary.BigEndian.PutUint16(buf[6:8], uint16(protocol.TypeFrame))
-	binary.BigEndian.PutUint16(buf[8:10], 0) // flags
+	binary.BigEndian.PutUint16(buf[8:10], 0)  // flags
 	binary.BigEndian.PutUint16(buf[10:12], 0) // reserved
 	binary.BigEndian.PutUint32(buf[12:16], protocol.MaxPixelPayloadHard+1)
 	binary.BigEndian.PutUint64(buf[16:24], 1) // sequence

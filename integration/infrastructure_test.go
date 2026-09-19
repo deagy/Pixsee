@@ -140,7 +140,7 @@ func (i *recordingInput) snapshot() (int, int) {
 // metadata and visual updates while the client only sends session/control
 // metadata and input events.
 type messageLog struct {
-	mu     sync.Mutex
+	mu      sync.Mutex
 	hostOut []protocol.Message // host -> client (peer.Send)
 	// hostIn records what the host received, i.e. what the client sent.
 	hostIn []protocol.Message

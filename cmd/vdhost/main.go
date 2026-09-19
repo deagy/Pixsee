@@ -159,6 +159,8 @@ func newRootCmd() *cobra.Command {
 	fs.String("key", "", "path to the PEM private key matching -ca")
 	fs.Duration("capture-interval", time.Second/30, "capture period")
 	fs.Duration("keyframe-interval", 10*time.Second, "periodic keyframe period")
+	fs.Duration("heartbeat-interval", 30*time.Second, "idle period before a heartbeat PING probe to the client")
+	fs.Duration("heartbeat-timeout", 30*time.Second, "silent period before a client is treated as gone")
 	fs.Int("max-input-per-sec", 500, "max input events per second")
 	fs.Bool("enable-input", true, "accept client input events")
 	fs.Duration("timeout", 10*time.Second, "per-operation I/O deadline")
@@ -167,18 +169,46 @@ func newRootCmd() *cobra.Command {
 }
 
 type appConfig struct {
-	addr             string
-	token            [32]byte
-	tlsConfig        *tls.Config
-	capture          host.Capture
-	input            func() (host.Input, error)
-	inputAdapter     host.Input
-	listen           func(ctx context.Context) (net.Listener, error)
-	captureInterval  time.Duration
-	keyframeInterval time.Duration
-	maxInputEvents   int
-	enableInput      bool
-	ioTimeout        time.Duration
+	addr              string
+	token             [32]byte
+	tlsConfig         *tls.Config
+	capture           host.Capture
+	input             func() (host.Input, error)
+	inputAdapter      host.Input
+	listen            func(ctx context.Context) (net.Listener, error)
+	captureInterval   time.Duration
+	keyframeInterval  time.Duration
+	heartbeatInterval time.Duration
+	heartbeatTimeout  time.Duration
+	maxInputEvents    int
+	enableInput       bool
+	ioTimeout         time.Duration
+
+	// sessionMu guards the single-active-session admission control. The host
+	// permits exactly one active client session at a time (docs §3, §5); a
+	// second authenticated connection is rejected with ERROR_BUSY instead of
+	// being accepted and leaking a goroutine.
+	sessionMu   sync.Mutex
+	sessionOpen bool
+}
+
+// admitSession claims the single active session. It returns false when a
+// session is already open, in which case the caller must reject the connection
+// as busy. releaseSession must be called when the session ends.
+func (c *appConfig) admitSession() bool {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	if c.sessionOpen {
+		return false
+	}
+	c.sessionOpen = true
+	return true
+}
+
+func (c *appConfig) releaseSession() {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	c.sessionOpen = false
 }
 
 // buildConfigFromViper performs the same validation and defaulting the
@@ -191,17 +221,21 @@ func buildConfigFromViper(v *viper.Viper) (*appConfig, error) {
 	keyPath := v.GetString("key")
 	captureRate := v.GetDuration("capture-interval")
 	keyframeRate := v.GetDuration("keyframe-interval")
+	heartbeatInterval := v.GetDuration("heartbeat-interval")
+	heartbeatTimeout := v.GetDuration("heartbeat-timeout")
 	maxInput := v.GetInt("max-input-per-sec")
 	enableInput := v.GetBool("enable-input")
 	timeout := v.GetDuration("timeout")
 
 	cfg := &appConfig{
-		addr:             addr,
-		captureInterval:  captureRate,
-		keyframeInterval: keyframeRate,
-		maxInputEvents:   maxInput,
-		enableInput:      enableInput,
-		ioTimeout:        timeout,
+		addr:              addr,
+		captureInterval:   captureRate,
+		keyframeInterval:  keyframeRate,
+		heartbeatInterval: heartbeatInterval,
+		heartbeatTimeout:  heartbeatTimeout,
+		maxInputEvents:    maxInput,
+		enableInput:       enableInput,
+		ioTimeout:         timeout,
 	}
 	token, err := loadToken(tokenPath)
 	if err != nil {
@@ -325,6 +359,23 @@ func handleConnection(ctx context.Context, cfg *appConfig, conn net.Conn) {
 	}
 	fmt.Printf("vdhost: client authenticated from %s\n", conn.RemoteAddr())
 
+	// The host permits exactly one active client session (docs §3, §5). A
+	// second authenticated connection is rejected with ERROR_BUSY and closed
+	// before it can enter the service loop and leak a goroutine.
+	if !cfg.admitSession() {
+		if err := peer.Send(ctx, protocol.ErrorMessage{
+			Code:       protocol.ErrorBusy,
+			Diagnostic: "another client already holds the session",
+		}); err != nil {
+			_ = conn.Close()
+			fmt.Fprintf(os.Stderr, "vdhost: busy: send error: %v\n", err)
+			return
+		}
+		_ = conn.Close()
+		return
+	}
+	defer cfg.releaseSession()
+
 	// Negotiating: the client sends CLIENT_HELLO and the host replies with
 	// SERVER_HELLO before any DISPLAY_CONFIG/FRAME traffic. Without this
 	// exchange the peer's session state machine stays in the Negotiating
@@ -369,6 +420,8 @@ func handleConnection(ctx context.Context, cfg *appConfig, conn net.Conn) {
 		KeyframeInterval:        cfg.keyframeInterval,
 		MaxInputEventsPerSecond: cfg.maxInputEvents,
 		EnableInput:             cfg.enableInput,
+		HeartbeatInterval:       cfg.heartbeatInterval,
+		HeartbeatTimeout:        cfg.heartbeatTimeout,
 	}, cfg.capture, input)
 	if err := svc.Run(ctx, peer); err != nil {
 		fmt.Fprintf(os.Stderr, "vdhost: session ended: %v\n", err)

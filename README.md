@@ -90,7 +90,26 @@ single-character flags (e.g. `-h`) are unaffected.
 host started without `--token` accepts any non-zero client token, and a
 client started without `--token` mints a random one. A warning is printed
 to stderr in this mode — see `docs/architecture.md` for the security
-implications.
+implications. The same kind of loud stderr warning is printed when
+`--allow-insecure` is set, since it disables host certificate verification
+and must never be used against an untrusted host on a real network.
+
+`vdclient` accepts a `--connect-timeout` (default `0` = no limit) that
+bounds the whole initial connect sequence — dial, TLS handshake,
+authentication, and `CLIENT_HELLO`/`SERVER_HELLO` negotiation — across
+reconnect attempts. When it is exhausted the client returns an error
+instead of reconnecting forever against a dead host.
+
+`vdhost` admits exactly one active client session at a time. A second
+client that authenticates is rejected with a busy protocol error and
+closed, rather than being served a stale or interleaved view of the
+host's display.
+
+`vdhost` also exposes `-heartbeat-interval` (default `30s`) and
+`-heartbeat-timeout` (default `30s`) to configure dead-peer detection:
+after the interval elapses with no client activity the host sends a
+`PING` probe, and after the timeout elapses without a `PONG` (or any
+other message) it treats the session as gone.
 
 ## Configuration
 
@@ -125,6 +144,8 @@ ca: /etc/virtualdesktop/host-cert.pem
 key: /etc/virtualdesktop/host-key.pem
 capture-interval: 33ms
 keyframe-interval: 10s
+heartbeat-interval: 30s
+heartbeat-timeout: 30s
 max-input-per-sec: 500
 enable-input: true
 timeout: 10s
@@ -137,16 +158,20 @@ environment variable name matches a flag name exactly.
 ## Troubleshooting
 
 - **`config: While parsing config: yaml: control characters are not
-  allowed`** — this affected Windows builds (including Windows ARM64)
-  when a config file was created with a Windows tool that writes
-  non-UTF-8 text, e.g. PowerShell redirection (`>`) or `Set-Content`
-  without `-Encoding utf8`, or Notepad's legacy "Unicode" save option.
-  Those tools produce UTF-16 (with or without a byte-order mark), which
-  the YAML parser used to reject outright. `internal/cliconfig` now
-  detects and transcodes UTF-16/UTF-8-BOM config files (and strips stray
-  control bytes) before parsing, so this is fixed as of this release —
-  update to a build that includes the fix rather than re-encoding the
-  config file by hand. This never affected flags or environment
+  allowed`** — the YAML config file contains characters the YAML parser
+  refuses: NUL/C0 control bytes, DEL, the C1 range U+0080–U+009F,
+  surrogates or U+FFFE/U+FFFF. On Windows (including ARM64) this comes
+  from tools that re-encode text: PowerShell redirection (`>`) or
+  `Set-Content` without `-Encoding utf8` produce UTF-16, Notepad's legacy
+  "Unicode"/"ANSI" options, and Latin-1 mis-decodes (PowerShell 5.1
+  `Invoke-WebRequest`, some editors) that turn a multi-byte character
+  such as an em-dash into C1 controls. `internal/cliconfig` transcodes
+  UTF-16/UTF-8-BOM files and strips every character the parser refuses
+  before parsing, so current builds load such files. If a file still
+  fails, the error names the file that was loaded and the first
+  offending character with its line, column and byte offset; inspect
+  that spot with `Format-Hex <file>` (PowerShell) or `xxd` and re-save
+  the file as plain UTF-8. This never affected flags or environment
   variables, only YAML config files.
 
 - **No client window appears, and the client repeatedly logs
@@ -162,6 +187,13 @@ environment variable name matches a flag name exactly.
   both from the same release (an old `vdhost` paired with a new
   `vdclient`, or vice versa, can still exhibit protocol mismatches).
 
+- **A second `vdclient` connects but sees no display (or the client
+  exits with a busy error)** — `vdhost` admits exactly one active client
+  session at a time. A second client that authenticates is rejected with
+  a `busy` protocol error and closed before it can receive any frames.
+  This is normal: only one client can view the host's display. Connect a
+  different client, or close the first one before connecting another.
+
 ## Testing
 
 Run the full test suite:
@@ -174,6 +206,13 @@ make test
 
 `go vet ./...` (or `make vet`) is also part of the standard pre-commit
 check.
+
+Continuous integration runs the same gates on every push and pull request in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml): a `gofmt` formatting
+check, `go vet`, unit tests split so the RSA-2048 client handshake tests do not
+hold up the rest of the suite, a `-race` gate on the fast packages, the
+integration suite, a fixed-budget protocol fuzz smoke run, and a
+cross-compile of every release binary.
 
 Unit tests use [testify](https://github.com/stretchr/testify) (`assert`
 and `require`) for assertions, and [mockery](https://github.com/vektra/mockery)-generated

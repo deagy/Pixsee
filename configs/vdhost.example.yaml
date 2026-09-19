@@ -2,7 +2,7 @@
 #
 # vdhost looks for this file (named vdhost.yaml/.yml/.json/...) in, in
 # order: the current working directory, $HOME/.config/virtualdesktop, or
-# /etc/virtualdesktop — or you can point at an explicit file with -config.
+# /etc/virtualdesktop -- or you can point at an explicit file with -config.
 #
 # Precedence (highest wins): command-line flag > environment variable
 # (VDHOST_<FLAG_NAME>, e.g. VDHOST_ADDR, VDHOST_CAPTURE_INTERVAL) > this
@@ -17,6 +17,8 @@ addr: 127.0.0.1:6511
 # key: /etc/virtualdesktop/host-key.pem
 capture-interval: 33ms
 keyframe-interval: 10s
+heartbeat-interval: 30s
+heartbeat-timeout: 30s
 max-input-per-sec: 500
 enable-input: true
 timeout: 10s

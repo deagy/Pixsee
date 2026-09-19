@@ -18,6 +18,19 @@ func rectanglesOverlap(a, b Rectangle) bool {
 	return a.X < b.X+b.Width && b.X < a.X+a.Width && a.Y < b.Y+b.Height && b.Y < a.Y+a.Height
 }
 
+// absWheelClicks returns the total number of wheel detents a PointerWheel
+// event requests, summed across both axes (delta / 120).
+func absWheelClicks(horizontal, vertical int16) int {
+	h, v := int(horizontal)/120, int(vertical)/120
+	if h < 0 {
+		h = -h
+	}
+	if v < 0 {
+		v = -v
+	}
+	return h + v
+}
+
 func ValidateMessage(m Message, limits Limits) error {
 	limits = limits.bounded()
 	if m == nil {
@@ -99,6 +112,9 @@ func ValidateMessage(m Message, limits Limits) error {
 	case PointerWheel:
 		if !validInputHeader(v.Generation, v.InputSequence) || (v.Horizontal == 0 && v.Vertical == 0) || v.Horizontal%120 != 0 || v.Vertical%120 != 0 {
 			return ErrMalformed
+		}
+		if absWheelClicks(v.Horizontal, v.Vertical) > MaxWheelClicks {
+			return fmt.Errorf("%w: wheel delta exceeds %d detents", ErrMalformed, MaxWheelClicks)
 		}
 	case FocusLost:
 		if !validInputHeader(v.Generation, v.InputSequence) {

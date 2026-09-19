@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -82,18 +83,24 @@ func New(fs *pflag.FlagSet, opts Options, configFile string) (*viper.Viper, erro
 
 	if err := v.ReadInConfig(); err != nil {
 		var notFound viper.ConfigFileNotFoundError
-		if !errors.As(err, &notFound) {
-			// Some Windows tools/editors (notably PowerShell redirection
-			// and Set-Content without an explicit -Encoding) write config
-			// files as UTF-16 without a byte-order mark, or leave stray
-			// control bytes in the file. gopkg's YAML decoder rejects
-			// those bytes outright with "control characters are not
-			// allowed", even though the file's intended content is
-			// perfectly valid YAML. Before giving up, try to recover by
-			// sanitizing the raw bytes (BOM stripping/UTF-16 transcoding,
-			// disallowed control byte removal) and re-parsing.
-			if used := v.ConfigFileUsed(); used != "" {
-				if raw, readErr := os.ReadFile(used); readErr == nil {
+		if errors.As(err, &notFound) {
+			// No config file found in the default search paths: fine, config
+			// files are optional.
+		} else {
+			used := v.ConfigFileUsed()
+			// Some Windows tools/editors (PowerShell redirection,
+			// Set-Content without an explicit -Encoding, Latin-1
+			// mis-decodes of the shipped example files, ...) write config
+			// files as UTF-16, add byte-order marks, or leave stray
+			// control characters in the text. The YAML decoder rejects
+			// those outright with "control characters are not allowed"
+			// even though the intended content is valid YAML. Before
+			// giving up, try to recover by sanitizing the raw bytes and
+			// re-parsing.
+			var raw []byte
+			if used != "" {
+				if data, readErr := os.ReadFile(used); readErr == nil {
+					raw = data
 					sanitized := sanitizeConfigBytes(raw)
 					if !bytes.Equal(sanitized, raw) {
 						v.SetConfigType("yaml")
@@ -103,16 +110,9 @@ func New(fs *pflag.FlagSet, opts Options, configFile string) (*viper.Viper, erro
 					}
 				}
 			}
-		}
-		if err != nil {
-			if !errors.As(err, &notFound) {
-				if configFile != "" {
-					return nil, fmt.Errorf("config: reading %s: %w", configFile, err)
-				}
-				return nil, fmt.Errorf("config: %w", err)
+			if err != nil {
+				return nil, describeConfigError(used, raw, err)
 			}
-			// No config file found in the default search paths: fine, config
-			// files are optional.
 		}
 	}
 
@@ -122,21 +122,55 @@ func New(fs *pflag.FlagSet, opts Options, configFile string) (*viper.Viper, erro
 	return v, nil
 }
 
+// describeConfigError wraps a config-file read/parse failure so the message
+// names the file that was actually used (the default search may have picked
+// it up from any of several directories) and, when the failure was caused by
+// a character the YAML decoder refuses, says which character and where it
+// is. That turns an opaque "control characters are not allowed" into
+// something a user can act on with a hex dump.
+func describeConfigError(path string, raw []byte, err error) error {
+	if path == "" {
+		return fmt.Errorf("config: %w", err)
+	}
+	if off, r, ok := firstDisallowedRune(raw); ok {
+		line, col := lineCol(raw, off)
+		return fmt.Errorf("config: reading %s: %w (first disallowed character U+%04X at line %d, column %d, byte offset %d)", path, err, r, line, col, off)
+	}
+	return fmt.Errorf("config: reading %s: %w", path, err)
+}
+
+// lineCol converts a byte offset into a 1-based line and column, counting
+// bytes as columns (adequate for pointing at a hex dump).
+func lineCol(data []byte, off int) (line, col int) {
+	line, col = 1, 1
+	for i := 0; i < off && i < len(data); i++ {
+		if data[i] == '\n' {
+			line++
+			col = 1
+		} else {
+			col++
+		}
+	}
+	return line, col
+}
+
 // sanitizeConfigBytes normalizes raw config-file bytes so they parse as
 // valid YAML regardless of the encoding quirks introduced by Windows tools
 // that generated or transcribed the file (PowerShell redirection/Set-Content
 // without an explicit encoding, Notepad's legacy "Unicode" save option,
-// etc.):
+// Latin-1 mis-decodes that turn multi-byte UTF-8 into C1 control
+// characters, etc.):
 //
 //   - A UTF-16 (LE or BE) byte-order mark is stripped and the remainder is
 //     transcoded to UTF-8.
 //   - Content that looks like UTF-16 (LE or BE) but is missing its BOM is
 //     detected heuristically and transcoded the same way.
 //   - A UTF-8 byte-order mark is stripped.
-//   - Any remaining bytes outside YAML's allowed character set (control
-//     bytes other than tab/LF/CR) are dropped; these can only be introduced
-//     by encoding corruption, since they never appear in a valid UTF-8
-//     multi-byte sequence.
+//   - Every remaining character the YAML decoder refuses (see
+//     yamlAllowsRune) is dropped, as is every byte that is not valid UTF-8.
+//     Neither can appear in a correctly encoded config file, so removing
+//     them can only turn a guaranteed parse failure into a best-effort
+//     success.
 //
 // A file that is already clean UTF-8 YAML is returned unchanged (byte for
 // byte), so callers can cheaply detect "no sanitization was needed" via
@@ -154,7 +188,7 @@ func sanitizeConfigBytes(data []byte) []byte {
 	case looksLikeUTF16(data, binary.BigEndian):
 		data = utf16ToUTF8(data, binary.BigEndian)
 	}
-	return stripDisallowedControlBytes(data)
+	return stripDisallowedRunes(data)
 }
 
 // looksLikeUTF16 heuristically detects BOM-less UTF-16 text: in that
@@ -201,21 +235,66 @@ func utf16ToUTF8(data []byte, order binary.ByteOrder) []byte {
 	return []byte(string(utf16.Decode(units)))
 }
 
-// stripDisallowedControlBytes removes bytes that the YAML 1.1 character
-// set forbids outside of tab/LF/CR, without disturbing multi-byte UTF-8
-// sequences: continuation and lead bytes for non-ASCII runes are always
-// >= 0x80, so a byte-wise filter over the C0 control range and DEL is safe.
-func stripDisallowedControlBytes(data []byte) []byte {
-	out := make([]byte, 0, len(data))
-	for _, b := range data {
-		switch {
-		case b == 0x09 || b == 0x0A || b == 0x0D: // tab, LF, CR
-			out = append(out, b)
-		case b < 0x20 || b == 0x7F: // other C0 control bytes / DEL
-			continue
-		default:
-			out = append(out, b)
+// yamlAllowsRune reports whether the YAML decoder (go.yaml.in/yaml/v3,
+// readerc.go) accepts r in a document. This is the YAML 1.1 printable set:
+//
+//	#x9 | #xA | #xD | [#x20-#x7E] | #x85 | [#xA0-#xD7FF] | [#xE000-#xFFFD]
+//	| [#x10000-#x10FFFF]
+//
+// Everything else -- C0 controls, DEL and the C1 range (U+007F-U+009F other
+// than NEL), surrogates and the U+FFFE/U+FFFF non-characters -- makes the
+// decoder fail with "control characters are not allowed".
+func yamlAllowsRune(r rune) bool {
+	switch {
+	case r == 0x09, r == 0x0A, r == 0x0D:
+		return true
+	case r >= 0x20 && r <= 0x7E:
+		return true
+	case r == 0x85:
+		return true
+	case r >= 0xA0 && r <= 0xD7FF:
+		return true
+	case r >= 0xE000 && r <= 0xFFFD:
+		return true
+	case r >= 0x10000 && r <= 0x10FFFF:
+		return true
+	}
+	return false
+}
+
+// firstDisallowedRune scans data as UTF-8 and returns the byte offset and
+// value of the first character the YAML decoder would refuse. An invalid
+// UTF-8 byte is reported as utf8.RuneError.
+func firstDisallowedRune(data []byte) (offset int, r rune, ok bool) {
+	for i := 0; i < len(data); {
+		r, size := utf8.DecodeRune(data[i:])
+		if r == utf8.RuneError && size == 1 {
+			return i, r, true
 		}
+		if !yamlAllowsRune(r) {
+			return i, r, true
+		}
+		i += size
+	}
+	return 0, 0, false
+}
+
+// stripDisallowedRunes removes every character the YAML decoder refuses
+// (see yamlAllowsRune) and every byte that is not valid UTF-8, keeping all
+// other characters -- including multi-byte ones -- intact. Valid input is
+// returned as a fresh but byte-identical slice.
+func stripDisallowedRunes(data []byte) []byte {
+	out := make([]byte, 0, len(data))
+	for i := 0; i < len(data); {
+		r, size := utf8.DecodeRune(data[i:])
+		if r == utf8.RuneError && size == 1 {
+			i++ // invalid byte: drop it
+			continue
+		}
+		if yamlAllowsRune(r) {
+			out = append(out, data[i:i+size]...)
+		}
+		i += size
 	}
 	return out
 }

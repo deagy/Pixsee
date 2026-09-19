@@ -106,7 +106,11 @@ func TestServiceRunRejectsInvalidInputMessage(t *testing.T) {
 	image := damage.Image{Width: 2, Height: 2, Pixels: make([]byte, 2*2*4)}
 	capture.EXPECT().Capture(mock.Anything, uint32(0)).Return(image, nil).Once()
 	peer.EXPECT().Send(mock.Anything, mock.Anything).Return(nil)
-	peer.EXPECT().Receive(mock.Anything).Return(protocol.Pong{}, nil).Once()
+	// PING/PONG/KEYFRAME_REQUEST are valid control messages now, so an
+	// "invalid input" must be something that carries no input header. A
+	// DISPLAY_CONFIG is neither input nor a control message the input loop
+	// handles, so it is rejected as invalid host input.
+	peer.EXPECT().Receive(mock.Anything).Return(protocol.DisplayConfig{}, nil).Once()
 	input.EXPECT().ReleaseAll(mock.Anything).Return(nil).Once()
 
 	svc := NewService(mockTestConfig(), capture, input)

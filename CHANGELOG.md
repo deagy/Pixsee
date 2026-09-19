@@ -9,7 +9,70 @@ itself; releases are tagged in git).
 
 ## Unreleased
 
-Nothing yet.
+### Fixed
+
+- **Windows ARM64 config parsing crash, second round.** The v1.3.1 fix
+  only handled UTF-16/BOM files, but `pixsee_host_windows_arm64.exe`
+  from v1.3.1 still failed on Windows 11 ARM64 with
+  `config: While parsing config: yaml: control characters are not
+  allowed`. The YAML decoder also refuses DEL..U+0084, the C1 controls
+  U+0086..U+009F, UTF-16 surrogates and U+FFFE/U+FFFF; those are valid
+  UTF-8, so the old byte-level sanitizer left such files untouched and
+  never retried. The concrete trigger was the em-dash in the shipped
+  example configs after a Latin-1 mis-decode (e.g. PowerShell 5.1
+  `Invoke-WebRequest`, or an editor treating the file as "ANSI").
+  `internal/cliconfig` now sanitizes rune by rune against the decoder's
+  exact allowed set and drops invalid UTF-8 bytes, the example configs
+  are ASCII-only, and a config error now names the file that was
+  actually loaded (including when found via the default search) plus
+  the first disallowed character, its line/column and byte offset.
+  Covered by `internal/cliconfig/cliconfig_windows_c1_encoding_test.go`.
+- **Second client leaked a goroutine and a listener slot.** `vdhost`
+  accepted every authenticated connection, so a second client
+  authenticated, blocked forever reading `CLIENT_HELLO`, and never
+  released its resources. `vdhost` now admits exactly one active client
+  session: a second authenticated connection is rejected with
+  `ERROR_BUSY` and closed before entering the service loop.
+- **No keyframe recovery or heartbeat.** The host ignored the client's
+  `KEYFRAME_REQUEST`, so a client that could not apply a delta ended its
+  session instead of resynchronizing, and neither side exchanged
+  `PING`/`PONG` to detect a dead peer. `internal/host` now handles
+  `KEYFRAME_REQUEST` by forcing the next visual update to be a
+  keyframe, sends `PING` after idle, and answers incoming `PING` with
+  `PONG`; an unhandled control message no longer silently ends the
+  session.
+- **Client could hang forever against a dead host.** `vdclient` gained a
+  `--connect-timeout` (default `0` = no limit) that bounds the whole
+  initial connect sequence — dial, TLS handshake, authentication, and
+  `CLIENT_HELLO`/`SERVER_HELLO` negotiation — across reconnect attempts.
+  When it is exhausted the client returns an error instead of
+  reconnecting forever. The initial dial now runs against the
+  timeout-bound context (`internal/client/session.go`), so the deadline
+  actually aborts a black-hole/firewall-dropped-port dial instead of
+  waiting indefinitely; a timeout during the first attempt returns the
+  distinct `client: connect timeout` error immediately rather than
+  falling through to the reconnect delay.
+- **Heartbeat feature shipped inert.** `internal/host` handled
+  `PING`/`PONG` and sent idle probes, but `vdhost` never exposed a way to
+  set the cadence — the 30s defaults were applied silently inside
+  `NewService`. `vdhost` now accepts `-heartbeat-interval` and
+  `-heartbeat-timeout` (default `30s` each) and passes them to the
+  service so the dead-peer detection is actually configurable.
+- **No startup warning for `-allow-insecure`.** `vdclient` now prints a
+  loud stderr warning when host certificate verification is disabled,
+  mirroring the tokenless-mode warning.
+- **Wheel-delta bound mismatch between protocol validation and host
+  injection.** `internal/protocol` and `internal/host/input` now agree on
+  the maximum wheel delta; the bound is asserted by
+  `TestWheelDeltaBound` so validation and injection cannot drift apart.
+
+### Docs
+
+- README documents the single-session guard, the `-allow-insecure`
+  startup warning, `--connect-timeout`, the new `vdhost` heartbeat flags,
+  and a troubleshooting entry for the busy error; CHANGELOG records the
+  second-round Windows ARM64 config fix and the host/client hardening
+  fixes above.
 
 ## v1.3.1 - 2026-09-11
 
