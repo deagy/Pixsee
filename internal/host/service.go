@@ -12,10 +12,10 @@ import (
 )
 
 var (
-	ErrInvalidInput       = errors.New("invalid host input")
-	ErrInputDisabled      = fmt.Errorf("%w: input is disabled", ErrInvalidInput)
-	ErrInputRate          = fmt.Errorf("%w: rate limit exceeded", ErrInvalidInput)
-	ErrHeartbeatTimeout   = errors.New("no response to heartbeat")
+	ErrInvalidInput     = errors.New("invalid host input")
+	ErrInputDisabled    = fmt.Errorf("%w: input is disabled", ErrInvalidInput)
+	ErrInputRate        = fmt.Errorf("%w: rate limit exceeded", ErrInvalidInput)
+	ErrHeartbeatTimeout = errors.New("no response to heartbeat")
 )
 
 type Capture interface {
