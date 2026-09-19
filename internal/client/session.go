@@ -42,8 +42,8 @@ type Config struct {
 	// returns an error instead of reconnecting forever against a black-hole
 	// IP or a firewall-dropped port. Zero disables the limit, preserving the
 	// historical behavior of retrying until the context is cancelled.
-	ConnectTimeout    time.Duration
-	Dial              func(context.Context) (net.Conn, error)
+	ConnectTimeout time.Duration
+	Dial           func(context.Context) (net.Conn, error)
 	// Input, when non-nil, is shared with the renderer instead of one being
 	// created here. The caller must supply it to both the renderer and the
 	// session so captured input reaches this session.
@@ -123,7 +123,9 @@ func (s *Session) Run(ctx context.Context) error {
 		} else {
 			s.notify(StateReconnecting, nil)
 		}
-		conn, err := s.config.Dial(ctx)
+		// Dial against runCtx so ConnectTimeout bounds the initial
+		// connect. The parent ctx still governs reconnection.
+		conn, err := s.config.Dial(runCtx)
 		if err == nil {
 			err = s.ServeConn(ctx, conn)
 		}
@@ -135,6 +137,13 @@ func (s *Session) Run(ctx context.Context) error {
 			// ServeConn returned cleanly (server sent CLOSE). Stop the loop.
 			s.notify(StateClosed, nil)
 			return nil
+		}
+		// If the initial dial was aborted by the connect timeout, surface
+		// that error now instead of treating it as a transient failure and
+		// waiting a reconnect delay against an already-expired deadline.
+		if attempt == 0 && runCtx != ctx && runCtx.Err() != nil {
+			s.notify(StateClosed, nil)
+			return fmt.Errorf("client: connect timeout: %w", runCtx.Err())
 		}
 		s.notify(StateError, err)
 		attempt++

@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -164,6 +165,49 @@ func TestRunReturnsOnCleanServerClose(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("ServeConn did not return after clean server CLOSE")
+	}
+}
+
+func TestConnectTimeoutBoundsInitialDial(t *testing.T) {
+	// Regression: the initial Dial must run against the timeout-bound
+	// context so ConnectTimeout actually aborts a black-hole dial.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dialCtx := make(chan context.Context, 1)
+	dial := func(d context.Context) (net.Conn, error) {
+		dialCtx <- d
+		<-d.Done()
+		return nil, d.Err()
+	}
+	session, err := NewSession(Config{
+		Token:          [32]byte{1},
+		TLSConfig:      &tls.Config{MinVersion: tls.VersionTLS13},
+		ReconnectDelay: time.Hour,
+		ConnectTimeout: 50 * time.Millisecond,
+		Dial:           dial,
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(3 * time.Second)
+	runErr := make(chan error, 1)
+	go func() { runErr <- session.Run(ctx) }()
+	select {
+	case d := <-dialCtx:
+		select {
+		case <-d.Done():
+			t.Fatal("dial received an already-cancelled context")
+		default:
+		}
+		<-d.Done()
+		if !errors.Is(d.Err(), context.DeadlineExceeded) {
+			t.Fatalf("dial cancelled with %v, want context.DeadlineExceeded", d.Err())
+		}
+	case <-deadline:
+		t.Fatal("dial was never invoked")
+	}
+	if err := <-runErr; !strings.Contains(err.Error(), "connect timeout") {
+		t.Fatalf("got %v, want a connect timeout error", err)
 	}
 }
 

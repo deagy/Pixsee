@@ -17,6 +17,8 @@ addr: 127.0.0.1:6511
 # key: /etc/virtualdesktop/host-key.pem
 capture-interval: 33ms
 keyframe-interval: 10s
+heartbeat-interval: 30s
+heartbeat-timeout: 30s
 max-input-per-sec: 500
 enable-input: true
 timeout: 10s

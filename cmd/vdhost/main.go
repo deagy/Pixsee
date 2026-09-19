@@ -159,6 +159,8 @@ func newRootCmd() *cobra.Command {
 	fs.String("key", "", "path to the PEM private key matching -ca")
 	fs.Duration("capture-interval", time.Second/30, "capture period")
 	fs.Duration("keyframe-interval", 10*time.Second, "periodic keyframe period")
+	fs.Duration("heartbeat-interval", 30*time.Second, "idle period before a heartbeat PING probe to the client")
+	fs.Duration("heartbeat-timeout", 30*time.Second, "silent period before a client is treated as gone")
 	fs.Int("max-input-per-sec", 500, "max input events per second")
 	fs.Bool("enable-input", true, "accept client input events")
 	fs.Duration("timeout", 10*time.Second, "per-operation I/O deadline")
@@ -167,18 +169,20 @@ func newRootCmd() *cobra.Command {
 }
 
 type appConfig struct {
-	addr             string
-	token            [32]byte
-	tlsConfig        *tls.Config
-	capture          host.Capture
-	input            func() (host.Input, error)
-	inputAdapter     host.Input
-	listen           func(ctx context.Context) (net.Listener, error)
-	captureInterval  time.Duration
-	keyframeInterval time.Duration
-	maxInputEvents   int
-	enableInput      bool
-	ioTimeout        time.Duration
+	addr              string
+	token             [32]byte
+	tlsConfig         *tls.Config
+	capture           host.Capture
+	input             func() (host.Input, error)
+	inputAdapter      host.Input
+	listen            func(ctx context.Context) (net.Listener, error)
+	captureInterval   time.Duration
+	keyframeInterval  time.Duration
+	heartbeatInterval time.Duration
+	heartbeatTimeout  time.Duration
+	maxInputEvents    int
+	enableInput       bool
+	ioTimeout         time.Duration
 
 	// sessionMu guards the single-active-session admission control. The host
 	// permits exactly one active client session at a time (docs §3, §5); a
@@ -217,17 +221,21 @@ func buildConfigFromViper(v *viper.Viper) (*appConfig, error) {
 	keyPath := v.GetString("key")
 	captureRate := v.GetDuration("capture-interval")
 	keyframeRate := v.GetDuration("keyframe-interval")
+	heartbeatInterval := v.GetDuration("heartbeat-interval")
+	heartbeatTimeout := v.GetDuration("heartbeat-timeout")
 	maxInput := v.GetInt("max-input-per-sec")
 	enableInput := v.GetBool("enable-input")
 	timeout := v.GetDuration("timeout")
 
 	cfg := &appConfig{
-		addr:             addr,
-		captureInterval:  captureRate,
-		keyframeInterval: keyframeRate,
-		maxInputEvents:   maxInput,
-		enableInput:      enableInput,
-		ioTimeout:        timeout,
+		addr:              addr,
+		captureInterval:   captureRate,
+		keyframeInterval:  keyframeRate,
+		heartbeatInterval: heartbeatInterval,
+		heartbeatTimeout:  heartbeatTimeout,
+		maxInputEvents:    maxInput,
+		enableInput:       enableInput,
+		ioTimeout:         timeout,
 	}
 	token, err := loadToken(tokenPath)
 	if err != nil {
@@ -412,6 +420,8 @@ func handleConnection(ctx context.Context, cfg *appConfig, conn net.Conn) {
 		KeyframeInterval:        cfg.keyframeInterval,
 		MaxInputEventsPerSecond: cfg.maxInputEvents,
 		EnableInput:             cfg.enableInput,
+		HeartbeatInterval:       cfg.heartbeatInterval,
+		HeartbeatTimeout:        cfg.heartbeatTimeout,
 	}, cfg.capture, input)
 	if err := svc.Run(ctx, peer); err != nil {
 		fmt.Fprintf(os.Stderr, "vdhost: session ended: %v\n", err)

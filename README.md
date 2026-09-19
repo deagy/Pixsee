@@ -105,6 +105,12 @@ client that authenticates is rejected with a busy protocol error and
 closed, rather than being served a stale or interleaved view of the
 host's display.
 
+`vdhost` also exposes `-heartbeat-interval` (default `30s`) and
+`-heartbeat-timeout` (default `30s`) to configure dead-peer detection:
+after the interval elapses with no client activity the host sends a
+`PING` probe, and after the timeout elapses without a `PONG` (or any
+other message) it treats the session as gone.
+
 ## Configuration
 
 Both commands resolve every configuration value with the same four-tier
@@ -138,6 +144,8 @@ ca: /etc/virtualdesktop/host-cert.pem
 key: /etc/virtualdesktop/host-key.pem
 capture-interval: 33ms
 keyframe-interval: 10s
+heartbeat-interval: 30s
+heartbeat-timeout: 30s
 max-input-per-sec: 500
 enable-input: true
 timeout: 10s

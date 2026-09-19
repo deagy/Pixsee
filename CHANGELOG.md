@@ -46,7 +46,18 @@ itself; releases are tagged in git).
   initial connect sequence — dial, TLS handshake, authentication, and
   `CLIENT_HELLO`/`SERVER_HELLO` negotiation — across reconnect attempts.
   When it is exhausted the client returns an error instead of
-  reconnecting forever.
+  reconnecting forever. The initial dial now runs against the
+  timeout-bound context (`internal/client/session.go`), so the deadline
+  actually aborts a black-hole/firewall-dropped-port dial instead of
+  waiting indefinitely; a timeout during the first attempt returns the
+  distinct `client: connect timeout` error immediately rather than
+  falling through to the reconnect delay.
+- **Heartbeat feature shipped inert.** `internal/host` handled
+  `PING`/`PONG` and sent idle probes, but `vdhost` never exposed a way to
+  set the cadence — the 30s defaults were applied silently inside
+  `NewService`. `vdhost` now accepts `-heartbeat-interval` and
+  `-heartbeat-timeout` (default `30s` each) and passes them to the
+  service so the dead-peer detection is actually configurable.
 - **No startup warning for `-allow-insecure`.** `vdclient` now prints a
   loud stderr warning when host certificate verification is disabled,
   mirroring the tokenless-mode warning.
@@ -58,9 +69,10 @@ itself; releases are tagged in git).
 ### Docs
 
 - README documents the single-session guard, the `-allow-insecure`
-  startup warning, `--connect-timeout`, and a troubleshooting entry for
-  the busy error; CHANGELOG records the second-round Windows ARM64
-  config fix and the host/client hardening fixes above.
+  startup warning, `--connect-timeout`, the new `vdhost` heartbeat flags,
+  and a troubleshooting entry for the busy error; CHANGELOG records the
+  second-round Windows ARM64 config fix and the host/client hardening
+  fixes above.
 
 ## v1.3.1 - 2026-09-11
 
