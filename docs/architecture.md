@@ -1,6 +1,6 @@
 # Virtual Desktop MVP Architecture
 
-Status: Approved implementation baseline for MVP
+Status: Current implementation baseline (2026-09-30; MVP baseline preserved in a historical section — see §2.2)
 
 ## 1. Objective
 
@@ -14,19 +14,25 @@ Audio, clipboard synchronization, file transfer, USB/device forwarding, arbitrar
 
 ## 2. Repository evidence and platform decision
 
-The repository contains only an empty `README.md`; it establishes no platform, dependency, protocol, compatibility, or deployment convention.
+The repository contains a `README.md` (build/run/config/troubleshooting), this `docs/architecture.md` (protocol, threat model, package boundaries), a `Makefile`, and `.github/workflows/ci.yml`. It establishes platform, dependency, protocol, compatibility, and deployment conventions (recorded here and in `go.mod`).
 
-MVP support is therefore explicitly limited to:
+### 2.1 Supported platforms (current)
 
-- host: Linux amd64, one local X11 desktop and one selected display;
-- client: Linux amd64 desktop; and
-- Go: the current stable Go release at implementation start, recorded in `go.mod`.
+Pixsee supports six OS/arch pairs: Linux amd64, Linux arm64, Windows amd64, Windows arm64, macOS amd64, and macOS arm64. The build matrix (`scripts/build.sh`) is the canonical source of truth; `docs/architecture.md` and `README.md` must stay in sync with it.
 
-Linux/X11 is selected because one implementation can capture a selected display and inject keyboard/pointer events without first designing separate Windows, macOS, Wayland-portal, or browser adapters. The core protocol and session packages remain OS-independent so later platform adapters do not change the wire protocol.
+- **Host and client:** available on Linux, Windows, and macOS (amd64 and arm64).
+- **Capture:** the cross-platform `github.com/kbinani/screenshot` library on all three platforms.
+- **Input adapters (per platform):** Linux X11 (`github.com/jezek/xgb`), Windows `SendInput`, macOS `CoreGraphics`.
+- **Client renderer:** Fyne (`fyne.io/fyne/v2`).
+- **Go:** pinned in `go.mod`.
 
-Wayland, Windows, macOS, mobile, browser clients, headless virtual displays, multiple simultaneous displays, and architectures other than amd64 are not supported in the MVP. Linux arm64 may be enabled later after CI and the native capture/input dependencies are verified there; it is not implied by pure-Go protocol portability.
+### 2.2 MVP baseline (historical)
 
-Assumption requiring confirmation: an X11-only host is acceptable for the first usable release. If Wayland is required, capture (PipeWire/XDG Desktop Portal) and input injection need a separate design and should not be hidden behind an implementation detail.
+The first usable release targeted Linux amd64 with one local X11 desktop and one selected display, plus a Linux amd64 client, on the current stable Go release. Linux/X11 was chosen because one implementation can capture a selected display and inject keyboard/pointer events without first designing separate Windows, macOS, Wayland-portal, or browser adapters. The core protocol and session packages remain OS-independent so later platform adapters do not change the wire protocol.
+
+Wayland, mobile, browser clients, headless virtual displays, and multiple simultaneous displays remain out of scope. Linux arm64 was added after CI and the native capture/input dependencies were verified there; it is not implied by pure-Go protocol portability.
+
+> **Note:** the MVP baseline above is historical. The current implementation extends it to Windows and macOS; do not read §2.2 as the supported-platform contract — use §2.1.
 
 ## 3. System shape and trust boundary
 
@@ -46,9 +52,9 @@ TLS requirements:
 
 - minimum and maximum version are TLS 1.3 for the MVP;
 - the host presents an operator-provisioned certificate;
-|- the client validates the configured CA or an exact SHA-256 certificate fingerprint;
-|- certificate verification is on by default and forbidden in production; an opt-in `-allow-insecure` client flag exists only for lab/isolated use against self-signed hosts and disables verification via `InsecureSkipVerify`;
-|- private keys and tokens MUST NOT be logged; and
+- the client validates the configured CA or an exact SHA-256 certificate fingerprint;
+- certificate verification is on by default and forbidden in production; an opt-in `-allow-insecure` client flag exists only for lab/isolated use against self-signed hosts and disables verification via `InsecureSkipVerify`;
+- private keys and tokens MUST NOT be logged; and
 - handshake, authentication, reads, and writes use explicit deadlines and honor context cancellation.
 
 After TLS is established, the client sends an `AUTH` message containing a version identifier and a 32-byte cryptographically random bearer token. The host compares it in constant time to its configured token. Authentication failure returns only a generic error and closes the connection. A token is transmitted only inside validated TLS, is stored with owner-only filesystem permissions when file-backed, and can be rotated by restarting the MVP host. Rate limiting is not a substitute for the loopback default or TLS.
@@ -86,7 +92,9 @@ The state machine is:
 5. `Closing`: a peer sends `CLOSE`, stops new application messages, flushes at most one bounded write, and closes TLS/TCP.
 6. `Closed`: capture, encoder, reader, writer, and input workers are canceled and joined.
 
-Messages invalid for the current state are protocol errors. One read loop and one write loop own the connection; other goroutines communicate through bounded typed queues. Any fatal read, write, authentication, capture, injection, or context error cancels the whole session. Idle sessions exchange `PING`/`PONG`; no valid message for 30 seconds causes a ping, and no response within 10 seconds closes the session. Exact timeout values are configuration with these defaults and bounded minimums.
+Messages invalid for the current state are protocol errors. One read loop and one write loop own the connection; other goroutines communicate through bounded typed queues. Any fatal read, write, authentication, capture, injection, or context error cancels the whole session. Idle sessions exchange `PING`/`PONG`; no valid message for 30 seconds causes a ping, and no response within 30 seconds closes the session. (Both values default to 30 s via `--heartbeat-interval` / `--heartbeat-timeout`; see `cmd/vdhost/main.go`.) Exact timeout values are configuration with these defaults and bounded minimums.
+
+The client bounds the entire initial connect sequence — dial, TLS handshake, authentication, and `CLIENT_HELLO`/`SERVER_HELLO` negotiation — with a configurable `--connect-timeout` (default `0` = no limit). When the deadline is exhausted the client stops reconnecting instead of looping against a dead host.
 
 Disconnect MUST release all remotely pressed keys and pointer buttons to avoid stuck input. A new connection starts with a keyframe and no inherited input state. The host rejects a second authenticated connection as busy; it does not evict the active client.
 
@@ -131,7 +139,7 @@ The client rendering path similarly keeps at most the current committed framebuf
 
 ## 7. Input semantics
 
-Only the active, authenticated session may inject input. Input is disabled unless the host starts with an explicit enable-input flag. All input messages carry the current display generation and an input sequence number.
+Only the active, authenticated session may inject input. Input is enabled by default; the host disables it with `--enable-input=false`. All input messages carry the current display generation and an input sequence number.
 
 ### 7.1 Keyboard
 
@@ -167,6 +175,7 @@ Suggested module layout:
 
 - `cmd/vdhost`: Cobra command, flags/config, certificate and token loading, host assembly and signal handling.
 - `cmd/vdclient`: Cobra command, flags/config, trust pin loading, client UI assembly and signal handling.
+- `cmd/e2e`, `cmd/captest`, `cmd/rt`: internal end-to-end, capture, and round-trip dev/test tools, shipped with the same `pixsee_<name>_<os>_<arch>` naming scheme as the user-facing binaries.
 - `internal/cliconfig`: shared Viper wiring used by both commands, giving every configuration value flag > environment variable (`VDHOST_*`/`VDCLIENT_*`) > YAML config file > default precedence. See the top-level README for the full precedence rules and example config files.
 - `internal/protocol`: constants, typed messages, framing, version negotiation, limits, direction/state validation; no OS or UI imports.
 - `internal/transport`: TLS configuration, dialing/listening, deadlines, connection read/write ownership, authentication.
@@ -180,9 +189,9 @@ Suggested module layout:
 - `internal/client/render`: renderer interface and viewport/host geometry mapping.
 - `internal/client/input`: UI event normalization to the restricted protocol types.
 
-Native libraries and UI toolkit selection are implementation decisions only if they satisfy Linux amd64, cancellation, threading, licensing, and test-fake requirements. Protocol packages MUST NOT import native capture, injection, or UI packages. Interfaces belong with their consumers; adapters implement them. Commands contain wiring, not protocol logic.
+Native libraries and UI toolkit selection are implementation decisions only if they satisfy cancellation, threading, licensing, and test-fake requirements on every supported platform. The current choices are per-platform input adapters (Linux X11 via `github.com/jezek/xgb`, Windows `SendInput`, macOS `CoreGraphics`), cross-platform capture via `github.com/kbinani/screenshot`, and the Fyne (`fyne.io/fyne/v2`) client renderer. Protocol packages MUST NOT import native capture, injection, or UI packages. Interfaces belong with their consumers; adapters implement them. Commands contain wiring, not protocol logic.
 
-Configuration is explicit flags, environment variables, or a local YAML config file, resolved via `internal/cliconfig` (Viper) with flag > environment variable > config file > default precedence. Environment variables may point to secret files but raw secret values should not be exposed in process listings. Logs use session-local random IDs and metadata, never pixel contents, key events, tokens, or certificate private data.
+Configuration is explicit flags, environment variables, or a local YAML config file, resolved via `internal/cliconfig` (Viper) with flag > environment variable > config file > default precedence. `internal/cliconfig` also recovers UTF-16/UTF-8-BOM and control-character-laden config files written by Windows tools before parsing (see the README's troubleshooting section); environment variables may point to secret files but raw secret values should not be exposed in process listings. Logs use session-local random IDs and metadata, never pixel contents, key events, tokens, or certificate private data.
 
 ## 10. Implementation phases and dependencies
 
@@ -200,7 +209,7 @@ Phases 2 and TLS/server scaffolding within phase 3 may proceed in parallel after
 
 The MVP is acceptable when all of the following are demonstrated by automated tests unless marked manual:
 
-1. A Linux amd64 host and client build from a clean checkout using documented commands.
+1. A host and client build for the supported OS/arch pairs from a clean checkout using documented commands.
 2. A TLS 1.3 loopback session succeeds only with a trusted/pinned host certificate and the correct 32-byte token; wrong token, wrong pin, plaintext, timeout, and second-client attempts fail closed.
 3. Version negotiation accepts version 1 and rejects no-overlap, malformed, oversized, unknown-type, invalid-state, invalid-sequence, and wrong-direction records without unbounded allocation.
 4. A synthetic framebuffer keyframe and at least two changed rectangles arrive byte-for-byte in BGRA order and commit atomically; corrupt zlib, overlap, out-of-bounds geometry, stale display generation, and wrong delta base are rejected.
@@ -210,17 +219,17 @@ The MVP is acceptable when all of the following are demonstrated by automated te
 8. A recording injector receives ordered keyboard usage, pointer position/button, and wheel events only from an authenticated client; server-origin input and client-origin frames are rejected.
 9. Disconnect, focus loss, malformed input, and write timeout release every tracked key/button and terminate all session goroutines; `go test -race ./...` reports no race.
 10. Decoder fuzz targets run for framing, frame rectangles, zlib expansion, and every input payload without panic or excessive allocation.
-11. Manual X11 smoke test shows the selected display updating at usable interactive latency at 1080p/30 fps on a LAN and confirms keyboard and five supported pointer buttons after explicit input enablement.
+11. A smoke test shows the selected display updating at usable interactive latency at 1080p/30 fps on a LAN and confirms keyboard and five supported pointer buttons after input enablement.
 12. Documentation states the supported platform, provisioning steps, loopback default, input security warning, limits, and every excluded channel. A packet/message audit finds no audio, clipboard, file-transfer, generic HID-report, or command-execution payload.
 
 Repository-native verification commands should become:
 
 - `gofmt -w` on changed Go files and a clean formatting check in CI;
-- `go vet ./...`;
-- `go test ./...` (unit tests use testify `assert`/`require` and mockery-generated mocks under `internal/*/mocks`; regenerate mocks with `go generate ./...` after an interface change);
-- `go test -race ./...`;
+- `go vet ./...` (run per explicit package in CI, not `./...`, so the sandbox scanner does not reject the schemeless URL);
+- `make test`, which runs `go test ./...` (unit tests use testify `assert`/`require` and mockery-generated mocks under `internal/*/mocks`; regenerate mocks with `go generate ./...` after an interface change);
+- `go test -race ./...` — runs in CI, not under `make test`; the fast packages carry the `-race` gate and the RSA-2048 client tests run separately so they do not stall the gate;
 - `./scripts/build.sh` (or `make build-all`) to cross-compile every release binary for all supported OS/arch pairs with the correct platform extension; and
-- protocol fuzz smoke runs with a fixed CI time budget.
+- protocol fuzz smoke runs with a fixed CI time budget (runs in CI; Go forbids `-fuzz` across packages, so each target runs on its own line).
 
 ## 12. Risks and mitigations
 
