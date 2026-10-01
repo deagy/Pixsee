@@ -119,11 +119,14 @@ func (s *Service) Run(ctx context.Context, peer Peer) error {
 	// heartbeat config so the heartbeat watchdog — not a short per-operation
 	// I/O deadline — owns dead-peer detection. Establishment reads keep the
 	// peer's IOTimeout until the first DISPLAY_CONFIG flips the session to
-	// Active; the switch is the peer's own state machine, applied here for
-	// whichever concrete peer the caller passed in.
-	if setter, ok := peer.(interface{ SetSteadyReadTimeout(time.Duration) }); ok {
-		setter.SetSteadyReadTimeout(s.config.HeartbeatInterval + s.config.HeartbeatTimeout + transport.HeartbeatSlack)
+	// Active. The arming is MANDATORY (verifier follow-on N1): a peer that
+	// does not implement SetSteadyReadTimeout would silently regress F2, so
+	// Run refuses to start the session instead of skipping the arming.
+	setter, ok := peer.(interface{ SetSteadyReadTimeout(time.Duration) })
+	if !ok {
+		return fmt.Errorf("host service: peer %T does not implement SetSteadyReadTimeout; steady-state read deadlines must derive from the heartbeat config (F2/D7)", peer)
 	}
+	setter.SetSteadyReadTimeout(s.config.HeartbeatInterval + s.config.HeartbeatTimeout + transport.HeartbeatSlack)
 	image, err := s.capture.Capture(ctx, s.config.DisplayID)
 	if err != nil {
 		return fmt.Errorf("capture initial display: %w", err)

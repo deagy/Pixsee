@@ -18,7 +18,7 @@ func TestConfigPrecedenceFileThenEnvThenFlag(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte("addr: 127.0.0.1:7000\nmax-input-per-sec: 111\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := loadConfig([]string{"-config", configPath})
+	cfg, err := loadConfig([]string{"-config", configPath, "-no-auth"})
 	if err != nil {
 		t.Fatalf("loadConfig (file only): %v", err)
 	}
@@ -31,7 +31,7 @@ func TestConfigPrecedenceFileThenEnvThenFlag(t *testing.T) {
 
 	// 2. An environment variable overrides the config file value.
 	t.Setenv("VDHOST_ADDR", "127.0.0.1:8000")
-	cfg, err = loadConfig([]string{"-config", configPath})
+	cfg, err = loadConfig([]string{"-config", configPath, "-no-auth"})
 	if err != nil {
 		t.Fatalf("loadConfig (env over file): %v", err)
 	}
@@ -45,7 +45,7 @@ func TestConfigPrecedenceFileThenEnvThenFlag(t *testing.T) {
 
 	// 3. An explicit flag overrides both the environment variable and the
 	// config file.
-	cfg, err = loadConfig([]string{"-config", configPath, "-addr", "127.0.0.1:9000"})
+	cfg, err = loadConfig([]string{"-config", configPath, "-addr", "127.0.0.1:9000", "-no-auth"})
 	if err != nil {
 		t.Fatalf("loadConfig (flag over env+file): %v", err)
 	}
@@ -58,7 +58,7 @@ func TestConfigPrecedenceFileThenEnvThenFlag(t *testing.T) {
 // types (time.Duration), which Viper must coerce from the string env value.
 func TestConfigPrecedenceEnvDuration(t *testing.T) {
 	t.Setenv("VDHOST_TIMEOUT", "45s")
-	cfg, err := loadConfig(nil)
+	cfg, err := loadConfig([]string{"-no-auth"})
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestConfigPrecedenceEnvDuration(t *testing.T) {
 // TestConfigDefaultsWithoutOverrides proves that with no file, env, or flag
 // override, the flag's built-in default is used unchanged.
 func TestConfigDefaultsWithoutOverrides(t *testing.T) {
-	cfg, err := loadConfig(nil)
+	cfg, err := loadConfig([]string{"-no-auth"})
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}

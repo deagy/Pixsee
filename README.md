@@ -87,13 +87,22 @@ Single-dash long flags (e.g. `-addr`) are still accepted for compatibility
 with earlier invocations and scripts; `--addr` is equivalent. Short,
 single-character flags (e.g. `-h`) are unaffected.
 
-`vdhost` and `vdclient` can each run without a token (tokenless mode): a
-host started without `--token` accepts any non-zero client token, and a
-client started without `--token` mints a random one. A warning is printed
-to stderr in this mode — see `docs/architecture.md` for the security
-implications. The same kind of loud stderr warning is printed when
+`vdhost` must be configured with authentication material: a host started
+without `--token` refuses to start unless `--no-auth` is passed explicitly,
+and even then it binds only to loopback (`127.0.0.0/8`, `::1`, `localhost`) —
+a non-loopback address always requires `--token`, and `--no-auth` does not
+unlock it. A `--token` file readable or writable by anyone other than its
+owner is refused (`chmod 0600`). Tokenless mode prints a loud stderr warning
+naming the opt-in — see `docs/architecture.md` for the security implications.
+A client started without `--token` mints a random non-zero token, which a
+tokenless host accepts. The same kind of loud stderr warning is printed when
 `--allow-insecure` is set, since it disables host certificate verification
 and must never be used against an untrusted host on a real network.
+
+Started without `--ca`/`--key`, `vdhost` serves an ephemeral self-signed
+certificate (valid 1 h) and prints its SHA-256 fingerprint at startup; pass
+that printed value to the client as `--fingerprint` to pin the host
+certificate instead of using `--allow-insecure`.
 
 `vdclient` accepts a `--connect-timeout` (default `0` = no limit) that
 bounds the whole initial connect sequence — dial, TLS handshake,

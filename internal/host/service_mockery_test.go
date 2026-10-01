@@ -25,6 +25,16 @@ func mockTestConfig() Config {
 	return Config{DisplayID: 0, CaptureInterval: 1, KeyframeInterval: 0, MaxInputEventsPerSecond: 100, EnableInput: true}
 }
 
+// steadyPeer adapts a mocks.MockPeer to Service.Run's mandatory
+// SetSteadyReadTimeout contract (F2/D7, verifier follow-on N1): the generated
+// mock only carries the documented Peer interface (Send/Receive), the wrapper
+// promotes it and adds the steady-deadline method Run requires.
+type steadyPeer struct {
+	*mocks.MockPeer
+}
+
+func (steadyPeer) SetSteadyReadTimeout(time.Duration) {}
+
 // TestServiceRunHappyPathSendsDisplayAndFrame proves that on a successful
 // initial capture, Run sends exactly one DisplayConfig then one Frame before
 // the context is cancelled, and cleans up by releasing all input.
@@ -50,7 +60,7 @@ func TestServiceRunHappyPathSendsDisplayAndFrame(t *testing.T) {
 
 	svc := NewService(mockTestConfig(), capture, input)
 	done := make(chan error, 1)
-	go func() { done <- svc.Run(ctx, peer) }()
+	go func() { done <- svc.Run(ctx, steadyPeer{peer}) }()
 	cancel()
 
 	err := <-done
@@ -68,7 +78,7 @@ func TestServiceRunCaptureErrorPropagates(t *testing.T) {
 	capture.EXPECT().Capture(mock.Anything, uint32(0)).Return(damage.Image{}, boom).Once()
 
 	svc := NewService(mockTestConfig(), capture, input)
-	err := svc.Run(context.Background(), peer)
+	err := svc.Run(context.Background(), steadyPeer{peer})
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, boom)
@@ -89,7 +99,7 @@ func TestServiceRunSendErrorPropagates(t *testing.T) {
 	peer.EXPECT().Send(mock.Anything, mock.AnythingOfType("protocol.DisplayConfig")).Return(boom).Once()
 
 	svc := NewService(mockTestConfig(), capture, input)
-	err := svc.Run(context.Background(), peer)
+	err := svc.Run(context.Background(), steadyPeer{peer})
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, boom)
@@ -114,7 +124,7 @@ func TestServiceRunRejectsInvalidInputMessage(t *testing.T) {
 	input.EXPECT().ReleaseAll(mock.Anything).Return(nil).Once()
 
 	svc := NewService(mockTestConfig(), capture, input)
-	err := svc.Run(context.Background(), peer)
+	err := svc.Run(context.Background(), steadyPeer{peer})
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInvalidInput)
@@ -148,7 +158,7 @@ func TestServiceRunInjectsKeyInput(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	svc := NewService(mockTestConfig(), capture, input)
 	done := make(chan error, 1)
-	go func() { done <- svc.Run(ctx, peer) }()
+	go func() { done <- svc.Run(ctx, steadyPeer{peer}) }()
 
 	select {
 	case <-keyDelivered:
@@ -171,10 +181,10 @@ func TestServiceRunRequiresDependencies(t *testing.T) {
 	assert.Error(t, err)
 
 	svcNoCapture := NewService(mockTestConfig(), nil, input)
-	err = svcNoCapture.Run(context.Background(), peer)
+	err = svcNoCapture.Run(context.Background(), steadyPeer{peer})
 	assert.Error(t, err)
 
 	svcNoInput := NewService(mockTestConfig(), capture, nil)
-	err = svcNoInput.Run(context.Background(), peer)
+	err = svcNoInput.Run(context.Background(), steadyPeer{peer})
 	assert.Error(t, err)
 }

@@ -65,6 +65,10 @@ func (p *fakePeer) Receive(ctx context.Context) (protocol.Message, error) {
 		return m, nil
 	}
 }
+
+// SetSteadyReadTimeout satisfies the mandatory steady-deadline contract of
+// Service.Run (F2/D7, N1); the fake records nothing and no-ops.
+func (p *fakePeer) SetSteadyReadTimeout(time.Duration) {}
 func (p *fakePeer) messages() []protocol.Message {
 	p.mu.Lock()
 	defer p.mu.Unlock()

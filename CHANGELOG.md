@@ -9,6 +9,40 @@ itself; releases are tagged in git).
 
 ## Unreleased
 
+### Changed
+
+- **The host now fails closed without authentication material** (F4 / AC-6,
+  owner decision Q2; supersedes the warning-only tokenless mode of v1.2.2).
+  `vdhost` refuses to start with a zero token: a non-loopback bind always
+  requires `--token`, and a loopback bind (`127.0.0.0/8`, `::1`, `localhost`)
+  requires the new explicit `--no-auth` opt-in and still prints a loud stderr
+  warning naming the flag. `--no-auth` does not unlock non-loopback binds.
+  Startup refusal exits non-zero with an error naming the bound address and
+  the fix.
+- **Token files accessible beyond their owner are refused.** A `--token`
+  path with any group/other permission (`mode & 0o077 != 0`) aborts startup
+  with a `chmod 0600` instruction (Windows relies on ACLs and is exempt).
+- **Ephemeral certificate fingerprints are published at startup** (F6 / AC-7,
+  owner decision Q3). Started without `--ca`/`--key`, `vdhost` prints the
+  self-signed leaf certificate's SHA-256 fingerprint and the matching
+  client-side `--fingerprint` usage. Validity stays 1 h; TOFU pinning is an
+  explicit follow-on.
+- **The heartbeat watchdog gives up only past an unanswered probe** (D7).
+  Give-up timing is measured from the last PING whose PONG never arrived
+  rather than elapsed-since-last-activity on a phase-aligned tick, so
+  scheduling jitter cannot reap a session whose keepalive is being answered.
+- **`host.Service.Run` requires peers to implement
+  `SetSteadyReadTimeout`** (verifier follow-on N1): a peer without the method
+  is now a startup error instead of silently skipping the steady-deadline
+  arming, so a future wrapper cannot regress F2 unnoticed.
+- **Client per-connection state and symmetric keepalive** (F1 / F2 / F3,
+  AC-1..AC-3, R1). A reconnecting `client.Session` now resets its framebuffer
+  and re-arms its input state per connection, and both sides derive their
+  steady-state read deadlines from the heartbeat config and send unsolicited
+  PINGs after half the heartbeat interval of idleness. `client.Config` gained
+  `HeartbeatInterval`/`HeartbeatTimeout` (default 30 s, symmetric with the
+  host's flags).
+
 ### Fixed
 
 - **Windows ARM64 config parsing crash, second round.** The v1.3.1 fix

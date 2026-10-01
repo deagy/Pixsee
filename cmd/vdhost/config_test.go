@@ -82,14 +82,14 @@ func TestLoadConfigTokenAndCAOptional(t *testing.T) {
 		wantToken bool // true if a non-zero token is expected
 	}{
 		{
-			name:      "no token no ca",
-			args:      []string{"-addr", "127.0.0.1:0"},
+			name:      "no token no ca (explicit -no-auth opt-in)",
+			args:      []string{"-addr", "127.0.0.1:0", "-no-auth"},
 			wantErr:   false,
 			wantToken: false,
 		},
 		{
-			name:      "no token with ca",
-			args:      []string{"-addr", "127.0.0.1:0", "-ca", caPath, "-key", keyPath},
+			name:      "no token with ca (explicit -no-auth opt-in)",
+			args:      []string{"-addr", "127.0.0.1:0", "-ca", caPath, "-key", keyPath, "-no-auth"},
 			wantErr:   false,
 			wantToken: false,
 		},

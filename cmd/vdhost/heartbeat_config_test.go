@@ -81,7 +81,10 @@ func TestLoadConfigHeartbeatValidation(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := loadConfig(tc.args)
+			// -no-auth is injected into every case: the auth gate (AC-6) runs
+			// on the same surface, and these tests must isolate heartbeat
+			// validation (AC-4) from it. Defaults stay untouched.
+			cfg, err := loadConfig(append([]string{"-no-auth"}, tc.args...))
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected startup refusal for %v, got cfg=%+v", tc.args, cfg)

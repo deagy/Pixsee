@@ -7,13 +7,16 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -44,8 +47,9 @@ const configFileName = "vdhost"
 
 // loadToken reads a 32-byte authentication token from a file. It accepts either
 // 32 raw bytes or 64 hexadecimal characters. An empty path yields the zero
-// token, which the host treats as no-authentication mode (any non-zero client
-// token is accepted). A provided path is still strictly validated.
+// token; validateAuthConfig then decides whether tokenless operation is
+// allowed at all (loopback bind + explicit -no-auth, per F4/AC-6). A provided
+// path is still strictly validated.
 func loadToken(path string) ([32]byte, error) {
 	var token [32]byte
 	if path == "" {
@@ -154,7 +158,7 @@ func newRootCmd() *cobra.Command {
 	fs := cmd.Flags()
 	fs.StringVar(&configFile, "config", "", "path to a YAML config file (default: search for vdhost.yaml in ., $HOME/.config/virtualdesktop, /etc/virtualdesktop)")
 	fs.String("addr", "127.0.0.1:6511", "host:port to listen on")
-	fs.String("token", "", "path to the 32-byte authentication token (raw or hex)")
+	fs.String("token", "", "path to the 32-byte authentication token (raw or hex); required for non-loopback binds and for loopback binds unless -no-auth is set")
 	fs.String("ca", "", "path to a PEM certificate to serve as the host certificate")
 	fs.String("key", "", "path to the PEM private key matching -ca")
 	fs.Duration("capture-interval", time.Second/30, "capture period")
@@ -164,6 +168,7 @@ func newRootCmd() *cobra.Command {
 	fs.Int("max-input-per-sec", 500, "max input events per second")
 	fs.Bool("enable-input", true, "accept client input events")
 	fs.Duration("timeout", 10*time.Second, "per-operation I/O deadline")
+	fs.Bool("no-auth", false, "explicitly run without an authentication token; valid ONLY for loopback binds (127.0.0.0/8, ::1, localhost). A non-loopback -addr always requires -token.")
 
 	return cmd
 }
@@ -182,6 +187,13 @@ type appConfig struct {
 	maxInputEvents    int
 	enableInput       bool
 	ioTimeout         time.Duration
+
+	// ephemeralCert is set when no -ca/-key pair was supplied and the host
+	// serves a fresh self-signed certificate; certFingerprint is the SHA-256
+	// of its leaf DER, published at startup so a client can pin it with
+	// -fingerprint (F6 / AC-7).
+	ephemeralCert   bool
+	certFingerprint [sha256.Size]byte
 
 	// sessionMu guards the single-active-session admission control. The host
 	// permits exactly one active client session at a time (docs §3, §5); a
@@ -319,6 +331,7 @@ func buildConfigFromViper(v *viper.Viper) (*appConfig, error) {
 	maxInput := v.GetInt("max-input-per-sec")
 	enableInput := v.GetBool("enable-input")
 	timeout := v.GetDuration("timeout")
+	noAuth := v.GetBool("no-auth")
 
 	cfg := &appConfig{
 		addr:              addr,
@@ -333,24 +346,130 @@ func buildConfigFromViper(v *viper.Viper) (*appConfig, error) {
 	if err := validateHeartbeatConfig(cfg.heartbeatInterval, cfg.heartbeatTimeout); err != nil {
 		return nil, err
 	}
+	if err := checkTokenFilePermissions(tokenPath); err != nil {
+		return nil, err
+	}
 	token, err := loadToken(tokenPath)
 	if err != nil {
 		return nil, fmt.Errorf("host: token: %w", err)
 	}
 	cfg.token = token
-	if cfg.token == [32]byte{} {
-		fmt.Fprintln(os.Stderr, "vdhost: WARNING: no -token supplied; accepting any client token (no authentication)")
+	// F4 / AC-6, owner decision Q2: the documented auth gate is enforced here,
+	// at the shared startup config surface, not deferred to connection
+	// handling. A non-loopback bind always requires a configured token;
+	// tokenless operation on loopback requires the explicit -no-auth opt-in.
+	if err := validateAuthConfig(addr, cfg.token, noAuth); err != nil {
+		return nil, err
+	}
+	if cfg.token == ([32]byte{}) {
+		// Tokenless mode is only reachable through the explicit -no-auth
+		// opt-in on a loopback bind (validated above); keep it loud (D5).
+		fmt.Fprintln(os.Stderr, "vdhost: WARNING: -no-auth explicitly accepted: running WITHOUT authentication; any non-zero client token is admitted (loopback bind only)")
 	}
 	tlsConfig, err := buildTLSConfig(caPath, keyPath)
 	if err != nil {
 		return nil, err
 	}
 	cfg.tlsConfig = tlsConfig
+	if caPath == "" || keyPath == "" {
+		// Ephemeral self-signed mode: compute the pin a client needs for
+		// -fingerprint; it is announced at startup (F6 / AC-7).
+		fp, err := ephemeralFingerprint(tlsConfig)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ephemeralCert, cfg.certFingerprint = true, fp
+	}
 	cfg.listen = func(ctx context.Context) (net.Listener, error) {
 		var d net.ListenConfig
 		return d.Listen(ctx, "tcp", addr)
 	}
 	return cfg, nil
+}
+
+// ephemeralCertValidity documents how long the self-signed ephemeral
+// certificate served in the no-CA path stays valid (spec Q3 decision: kept
+// at 1 h; renewal/TOFU pinning deferred out of R2).
+const ephemeralCertValidity = time.Hour
+
+// isLoopbackBind reports whether addr binds only to loopback interfaces:
+// 127.0.0.0/8, ::1, or the literal host "localhost" (AC-6 / Q2). An empty
+// host (":port"), the wildcards 0.0.0.0 / ::, and any routable address are
+// NOT loopback.
+func isLoopbackBind(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// validateAuthConfig enforces the fail-closed startup gate (F4 / AC-6): a
+// non-zero token always unlocks the host; without one, a non-loopback bind
+// is refused naming the address and the fix (set -token), and a loopback
+// bind is refused unless -no-auth was passed explicitly. -no-auth does NOT
+// unlock non-loopback binds (Q2: remote operation always requires real
+// authentication material).
+func validateAuthConfig(addr string, token [32]byte, noAuth bool) error {
+	if token != ([32]byte{}) {
+		return nil
+	}
+	if !isLoopbackBind(addr) {
+		return fmt.Errorf("host: refusing to start: non-loopback bind %v without authentication material; set -token to a 32-byte token file (a tokenless host may bind only to loopback; -no-auth does not unlock non-loopback binds)", addr)
+	}
+	if !noAuth {
+		return fmt.Errorf("host: refusing to start: loopback bind %v without a -token; pass -no-auth explicitly to run tokenless on loopback, or set -token", addr)
+	}
+	return nil
+}
+
+// checkTokenFilePermissions refuses a file-backed token that is accessible
+// beyond its owner: mode bits with any group/other permission leak a bearer
+// credential to the rest of the machine (AC-6).
+func checkTokenFilePermissions(path string) error {
+	if path == "" {
+		return nil
+	}
+	if runtime.GOOS == "windows" {
+		// Windows authorizes through ACLs; the POSIX mode bits Go reports
+		// there are synthetic and would reject every file.
+		return nil
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil // loadToken surfaces the canonical read error
+	}
+	if m := fi.Mode(); m&0o077 != 0 {
+		return fmt.Errorf("host: token file %s is accessible beyond its owner (mode %o); run chmod 0600 %s", path, m.Perm(), path)
+	}
+	return nil
+}
+
+// ephemeralFingerprint returns the SHA-256 of the leaf DER the host serves —
+// exactly the value transport.ClientTLSConfigForFingerprint compares against
+// the wire (PeerCertificates[0].Raw), so a client can paste the printed hex
+// into -fingerprint verbatim.
+func ephemeralFingerprint(cfg *tls.Config) ([sha256.Size]byte, error) {
+	var zero [sha256.Size]byte
+	if cfg == nil || len(cfg.Certificates) == 0 || len(cfg.Certificates[0].Certificate) == 0 {
+		return zero, errors.New("host: ephemeral certificate configuration serves no certificate")
+	}
+	return sha256.Sum256(cfg.Certificates[0].Certificate[0]), nil
+}
+
+// announceEphemeralCert publishes the ephemeral certificate's pin at startup
+// (F6 / AC-7) and points the operator at the client flag that consumes it, on
+// a single line so the copy-pasteable value never splits across reads. The
+// private key is never logged; only the public fingerprint.
+func announceEphemeralCert(w io.Writer, fingerprint [sha256.Size]byte) {
+	fmt.Fprintf(w, "vdhost: ephemeral certificate SHA-256 fingerprint: %x (self-signed, valid %v; connect a client with -fingerprint %x)\n", fingerprint, ephemeralCertValidity, fingerprint)
 }
 
 // loadConfig retains the pre-Cobra entrypoint signature for callers (and
@@ -420,6 +539,10 @@ func run(cfg *appConfig) error {
 	}
 	defer ln.Close()
 	fmt.Printf("vdhost listening on %s\n", ln.Addr())
+	if cfg.ephemeralCert {
+		// Publish the pin a client must use with -fingerprint (F6 / AC-7).
+		announceEphemeralCert(os.Stdout, cfg.certFingerprint)
+	}
 
 	for {
 		conn, err := ln.Accept()
