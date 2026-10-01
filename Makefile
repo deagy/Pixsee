@@ -8,7 +8,7 @@
 
 DIST_DIR := dist
 
-.PHONY: build build-all checksums test vet clean
+.PHONY: build build-all checksums test vet clean docs-check
 
 build: ## Build all binaries for the host OS/arch (no cross-compilation)
 	@mkdir -p $(DIST_DIR)
@@ -40,3 +40,6 @@ vet: ## Run go vet
 
 clean: ## Remove build artifacts
 	rm -rf $(DIST_DIR)
+
+docs-check: ## Warn (never fail) if docs drift from the build matrix/binaries
+	@./scripts/docs-check.sh
