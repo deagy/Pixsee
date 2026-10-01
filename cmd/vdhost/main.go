@@ -174,7 +174,6 @@ type appConfig struct {
 	tlsConfig         *tls.Config
 	capture           host.Capture
 	input             func() (host.Input, error)
-	inputAdapter      host.Input
 	listen            func(ctx context.Context) (net.Listener, error)
 	captureInterval   time.Duration
 	keyframeInterval  time.Duration
@@ -209,6 +208,72 @@ func (c *appConfig) releaseSession() {
 	c.sessionMu.Lock()
 	defer c.sessionMu.Unlock()
 	c.sessionOpen = false
+}
+
+// inputOwnership lazily creates the platform input adapter and owns closing
+// it when the host shuts down. run() installs get() as cfg.input so every
+// session injects through one shared adapter. Extracted verbatim from the
+// inline wiring in run() so the adapter lifetime (F5 / AC-5) is testable
+// against production code.
+type inputOwnership struct {
+	create func() (host.Input, error)
+
+	once     sync.Once
+	mu       sync.Mutex
+	adapter  host.Input
+	closer   func()
+	err      error
+	closeOne sync.Once
+}
+
+// newInputOwnership wires the platform adapter constructor (X11 on linux,
+// SendInput on windows, CoreGraphics on darwin) into the ownership.
+func newInputOwnership() *inputOwnership {
+	return &inputOwnership{create: func() (host.Input, error) {
+		inj, err := input.New()
+		if err != nil {
+			return nil, err
+		}
+		return inj, nil
+	}}
+}
+
+// get creates the adapter once and hands the same live adapter to every
+// caller. A successful create also records the adapter's shutdown closer.
+func (o *inputOwnership) get() (host.Input, error) {
+	o.once.Do(func() {
+		inj, err := o.create()
+		if err != nil {
+			o.err = err
+			return
+		}
+		closer, _ := inj.(interface{ Close() })
+		o.mu.Lock()
+		o.adapter = inj
+		if closer != nil {
+			o.closer = closer.Close
+		}
+		o.mu.Unlock()
+		if closer != nil {
+			defer closer.Close()
+		}
+	})
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.adapter, o.err
+}
+
+// close runs the recorded adapter close exactly once; safe when the adapter
+// was never created.
+func (o *inputOwnership) close() {
+	o.closeOne.Do(func() {
+		o.mu.Lock()
+		c := o.closer
+		o.mu.Unlock()
+		if c != nil {
+			c()
+		}
+	})
 }
 
 // buildConfigFromViper performs the same validation and defaulting the
@@ -309,20 +374,14 @@ func run(cfg *appConfig) error {
 	// uses CoreGraphics.
 	cfg.capture = capture.New()
 
-	var inputErr error
-	var inputOnce sync.Once
-	cfg.input = func() (host.Input, error) {
-		inputOnce.Do(func() {
-			inj, err := input.New()
-			if err != nil {
-				inputErr = err
-				return
-			}
-			defer inj.Close()
-			cfg.inputAdapter = inj
-		})
-		return cfg.inputAdapter, inputErr
-	}
+	// The input adapter is created lazily on the first session. This wiring is
+	// extracted verbatim from the inline block that used to sit here as a test
+	// seam, so the adapter lifetime (F5 / AC-5) is covered by tests of the real
+	// production code. Behavior is unchanged from the baseline — including the
+	// close-at-creation defect — so the seam's red run measures the actual
+	// finding before R1 moves the close to host shutdown.
+	ownership := newInputOwnership()
+	cfg.input = ownership.get
 
 	ln, err := cfg.listen(ctx)
 	if err != nil {
