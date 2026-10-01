@@ -9,6 +9,7 @@ import (
 
 	"virtualdesktop/internal/damage"
 	"virtualdesktop/internal/protocol"
+	"virtualdesktop/internal/transport"
 )
 
 var (
@@ -42,10 +43,14 @@ type Config struct {
 	MaxInputEventsPerSecond int
 	EnableInput             bool
 	Damage                  damage.Config
-	// HeartbeatInterval is how long the idle host waits before sending a
-	// PING probe to a connected client; HeartbeatTimeout is how long the host
-	// waits for a PONG (or any message) after the last activity before it
-	// treats the session as gone. Both default to 30s when zero.
+	// HeartbeatInterval is the heartbeat cadence: an unsolicited PING probe
+	// goes out to the client once half this interval has passed without any
+	// message from it (spec D7: both sides probe at HeartbeatInterval/2 of
+	// idle). HeartbeatTimeout is how long a fully silent peer survives before
+	// the watchdog treats the session as gone. Both default to 30s when zero.
+	// In the steady state the read deadline is interval + timeout +
+	// transport.HeartbeatSlack, so the watchdog — never a short per-operation
+	// I/O deadline — owns dead-peer detection.
 	HeartbeatInterval time.Duration
 	HeartbeatTimeout  time.Duration
 }
@@ -101,6 +106,15 @@ func NewService(config Config, capture Capture, input Input) *Service {
 func (s *Service) Run(ctx context.Context, peer Peer) error {
 	if ctx == nil || peer == nil || s.capture == nil || s.input == nil {
 		return errors.New("host service requires context, peer, capture, and input adapters")
+	}
+	// D7: in the steady state (Active) the read deadline derives from the
+	// heartbeat config so the heartbeat watchdog — not a short per-operation
+	// I/O deadline — owns dead-peer detection. Establishment reads keep the
+	// peer's IOTimeout until the first DISPLAY_CONFIG flips the session to
+	// Active; the switch is the peer's own state machine, applied here for
+	// whichever concrete peer the caller passed in.
+	if setter, ok := peer.(interface{ SetSteadyReadTimeout(time.Duration) }); ok {
+		setter.SetSteadyReadTimeout(s.config.HeartbeatInterval + s.config.HeartbeatTimeout + transport.HeartbeatSlack)
 	}
 	image, err := s.capture.Capture(ctx, s.config.DisplayID)
 	if err != nil {
@@ -247,11 +261,18 @@ func (s *Service) recordActivity() {
 }
 
 // heartbeatLoop implements the idle-session watchdog described in
-// docs/architecture.md: after HeartbeatInterval of inactivity the host probes
-// the client with a PING; if no message (PING, PONG, or otherwise) arrives
-// within HeartbeatTimeout the session is treated as gone.
+// docs/architecture.md: once the peer has sent nothing for half the heartbeat
+// interval the host probes it with an unsolicited PING (spec D7: both sides
+// probe at HeartbeatInterval/2 of idle), and a peer silent for a full
+// HeartbeatTimeout is treated as gone. The probe fires on every tick while
+// the peer stays quiet, so a live peer's PONG — or any other traffic — keeps
+// resetting the give-up clock.
 func (s *Service) heartbeatLoop(ctx context.Context, peer Peer, errs chan<- error) {
-	ticker := time.NewTicker(s.config.HeartbeatInterval)
+	half := s.config.HeartbeatInterval / 2
+	if half <= 0 {
+		half = s.config.HeartbeatInterval
+	}
+	ticker := time.NewTicker(half)
 	defer ticker.Stop()
 	for {
 		select {
@@ -265,7 +286,7 @@ func (s *Service) heartbeatLoop(ctx context.Context, peer Peer, errs chan<- erro
 				report(errs, ErrHeartbeatTimeout)
 				return
 			}
-			if elapsed >= s.config.HeartbeatInterval {
+			if elapsed >= half {
 				s.mu.Lock()
 				s.pingNonce++
 				nonce := s.pingNonce

@@ -5,12 +5,15 @@ package integration
 //	TestOracleFullSessionReconnect         — AC-1/AC-2 (F1 reconnect, F3 input dead)
 //	TestIdleSoakSurvivesQuietSession       — AC-3     (F2 keepalive dead code)
 //	TestHeartbeatWatchdogProbesSilentPeer  — F2/AC-3  (watchdog owns dead peers)
+//	TestClientKeepaliveProbesIdleHost      — D7 client PING (authored with the
+//	                                        R1 fix; needs the client.Config
+//	                                        heartbeat surface that R1 adds)
 //
-// Each test drives only the config surface that exists at the baseline commit
-// f7bb427 (host.Config heartbeat fields, transport peer timeouts, client.Config
-// IOTimeout) so the file compiles and fails at runtime against the baseline,
-// not at compile time. Time values are short per spec D3 so the suite stays
-// under the CI budget.
+// The first three drive only the config surface that exists at the baseline
+// commit f7bb427 (host.Config heartbeat fields, transport peer timeouts,
+// client.Config IOTimeout) so they compile and fail at runtime against the
+// baseline, not at compile time. Time values are short per spec D3 so the
+// suite stays under the CI budget.
 
 import (
 	"context"
@@ -238,7 +241,7 @@ func establishSilentClient(ctx context.Context, clientTLS *tls.Config, token [32
 }
 
 // TestIdleSoakSurvivesQuietSession asserts AC-3: with the test-parameterized
-// short heartbeat flags (interval 2s, timeout 2s, per spec D3) a session must
+// short heartbeat flags (interval 4s, timeout 4s, per spec D3) a session must
 // survive at least 2x(HeartbeatInterval+HeartbeatTimeout) while BOTH sides are
 // quiet — the client sends zero input events and the host streams a static
 // screen (no frames after the initial keyframe). Control-plane keepalive
@@ -251,9 +254,12 @@ func establishSilentClient(ctx context.Context, clientTLS *tls.Config, token [32
 // quiet reads. The test must NOT keep the session alive by typing or by
 // changing the captured image.
 func TestIdleSoakSurvivesQuietSession(t *testing.T) {
+	// D3 short flags. 4s/4s (rather than the spec's 2s example) doubles the
+	// PONG tolerance for a test box that may be loaded; the invariant and the
+	// failure mechanism are identical and the soak stays under the 30s budget.
 	const (
-		heartbeatInterval = 2 * time.Second
-		heartbeatTimeout  = 2 * time.Second
+		heartbeatInterval = 4 * time.Second
+		heartbeatTimeout  = 4 * time.Second
 	)
 	soak := 2 * (heartbeatInterval + heartbeatTimeout)
 
@@ -435,4 +441,117 @@ func TestHeartbeatWatchdogProbesSilentPeer(t *testing.T) {
 		t.Fatal("host must ReleaseAll when the heartbeat watchdog closes the session")
 	}
 	cancel()
+}
+
+// TestClientKeepaliveProbesIdleHost covers the new client half of D7: both
+// sides send unsolicited PING after HeartbeatInterval/2 of idle. The host is
+// left at production-default heartbeats (30/30), so for the whole test window
+// only the CLIENT probes — at symmetric short client flags (4s/4s, the D3
+// surface). The host answers PONG, the client's steady-state read deadline
+// (interval + timeout + slack) never expires, and the session stays Connected
+// with zero input events and a static screen.
+//
+// Authored in R1 alongside the client.Config heartbeat surface it drives: no
+// pre-fix configuration existed to configure this direction, so the red anchor
+// for F2 remains the soak (b) and the watchdog probe test (c) above.
+func TestClientKeepaliveProbesIdleHost(t *testing.T) {
+	const (
+		clientHeartbeatInterval = 4 * time.Second
+		clientHeartbeatTimeout  = 4 * time.Second
+		hostHeartbeatInterval   = 30 * time.Second
+		hostHeartbeatTimeout    = 30 * time.Second
+	)
+	// Watch 8s: long enough for several client PING ticks (interval/2 = 2s),
+	// comfortably inside the steady-state read deadline (4+4+5 = 13s) so the
+	// only way this passes is the client-initiated probe keeping the host
+	// responsive. (The 2x quiet-window invariant itself is asserted by
+	// TestIdleSoakSurvivesQuietSession.)
+	soak := 8 * time.Second
+
+	ctx, cancel := context.WithTimeout(context.Background(), soak+30*time.Second)
+	defer cancel()
+
+	serverTLS, clientTLS, _ := testTLS(t)
+	var token [32]byte
+	token[0] = 9
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	cap1 := &fakeCapture{}
+	cap1.setImage(8, 8, 0x10)
+	in1 := &recordingInput{}
+	log1 := &messageLog{}
+	svcExited := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			svcExited <- err
+			return
+		}
+		_, _, errc := quietHostService(ctx, c, serverTLS, token, cap1, in1, log1, hostHeartbeatInterval, hostHeartbeatTimeout)
+		svcExited <- <-errc
+	}()
+
+	renderer := &snapshotRenderer{}
+	observer := &stateRecorder{}
+	sess, err := client.NewSession(client.Config{
+		Token:             token,
+		TLSConfig:         clientTLS,
+		IOTimeout:         5 * time.Second,
+		ReconnectDelay:    50 * time.Millisecond,
+		HeartbeatInterval: clientHeartbeatInterval,
+		HeartbeatTimeout:  clientHeartbeatTimeout,
+		Dial:              func(context.Context) (net.Conn, error) { return net.Dial("tcp", ln.Addr().String()) },
+		Input:             client.NewInputState(nil),
+	}, renderer, observer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- sess.Run(ctx) }()
+	defer sess.Input().Disconnect()
+
+	waitFor(t, 15*time.Second, "initial keyframe", func() bool { return renderer.count() >= 1 })
+	if !observer.contains(client.StateConnected) {
+		t.Fatalf("client never reached Connected; states=%v", observer.states)
+	}
+
+	start := time.Now()
+	for time.Since(start) < soak {
+		select {
+		case err := <-svcExited:
+			t.Fatalf("idle session died after %v: host service exited with %v", time.Since(start), err)
+		default:
+		}
+		if state, ok := stateAfterConnected(observer); ok {
+			t.Fatalf("idle session regressed to state %v after %v", state, time.Since(start))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if n := log1.clientKinds()["PING"]; n < 1 {
+		t.Fatal("client never sent an unsolicited PING while idle; the D7 client-side keepalive is dead code")
+	}
+	if n := log1.hostKinds()["PONG"]; n < 1 {
+		t.Fatal("host never answered the client's PING with a PONG")
+	}
+	for _, forbidden := range []string{"KEY", "POINTER_MOVE", "POINTER_BUTTON", "POINTER_WHEEL", "FOCUS_LOST"} {
+		if n := log1.clientKinds()[forbidden]; n != 0 {
+			t.Fatalf("client sent %d %v messages during a zero-input soak", n, forbidden)
+		}
+	}
+	if n := log1.hostKinds()["FRAME"]; n != 1 {
+		t.Fatalf("static screen must produce exactly 1 FRAME, got %d", n)
+	}
+	select {
+	case err := <-svcExited:
+		t.Fatalf("host service exited at the end of the soak: %v", err)
+	default:
+	}
+	cancel()
+	<-done
 }

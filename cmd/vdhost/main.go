@@ -254,9 +254,10 @@ func (o *inputOwnership) get() (host.Input, error) {
 			o.closer = closer.Close
 		}
 		o.mu.Unlock()
-		if closer != nil {
-			defer closer.Close()
-		}
+		// F5 fix: nothing here closes the adapter. The baseline carried a
+		// `defer closer.Close()` in this body, which ran the moment the Once
+		// body returned — killing the injector (and every later injection and
+		// ReleaseAll) against a dead socket. Shutdown owns the close.
 	})
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -274,6 +275,33 @@ func (o *inputOwnership) close() {
 			c()
 		}
 	})
+}
+
+// maxHeartbeatFlag bounds -heartbeat-interval and -heartbeat-timeout: a
+// heartbeat that cannot fit inside a day is a misconfiguration, not a
+// remote-desktop keepalive policy (spec AC-4 "sane caps").
+const maxHeartbeatFlag = 24 * time.Hour
+
+// validateHeartbeatConfig enforces the startup invariant (AC-4 / D7): both
+// heartbeat flags positive and capped, and HeartbeatInterval no larger than
+// HeartbeatTimeout + transport.HeartbeatSlack. Without the invariant the
+// keepalive watchdog's own window cannot fit its read deadline: a probe would
+// only go out after the peer's reads were already expected to expire. The
+// error names both offending values.
+func validateHeartbeatConfig(interval, timeout time.Duration) error {
+	if interval <= 0 {
+		return fmt.Errorf("host: heartbeat-interval must be positive, got %v", interval)
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("host: heartbeat-timeout must be positive, got %v", timeout)
+	}
+	if interval > maxHeartbeatFlag || timeout > maxHeartbeatFlag {
+		return fmt.Errorf("host: heartbeat-interval %v and heartbeat-timeout %v must not exceed %v", interval, timeout, maxHeartbeatFlag)
+	}
+	if slack := transport.HeartbeatSlack; interval > timeout+slack {
+		return fmt.Errorf("host: heartbeat-interval %v exceeds heartbeat-timeout %v plus %v slack; the keepalive watchdog could not detect a dead peer before its own read deadline", interval, timeout, slack)
+	}
+	return nil
 }
 
 // buildConfigFromViper performs the same validation and defaulting the
@@ -301,6 +329,9 @@ func buildConfigFromViper(v *viper.Viper) (*appConfig, error) {
 		maxInputEvents:    maxInput,
 		enableInput:       enableInput,
 		ioTimeout:         timeout,
+	}
+	if err := validateHeartbeatConfig(cfg.heartbeatInterval, cfg.heartbeatTimeout); err != nil {
+		return nil, err
 	}
 	token, err := loadToken(tokenPath)
 	if err != nil {
@@ -374,14 +405,14 @@ func run(cfg *appConfig) error {
 	// uses CoreGraphics.
 	cfg.capture = capture.New()
 
-	// The input adapter is created lazily on the first session. This wiring is
-	// extracted verbatim from the inline block that used to sit here as a test
-	// seam, so the adapter lifetime (F5 / AC-5) is covered by tests of the real
-	// production code. Behavior is unchanged from the baseline — including the
-	// close-at-creation defect — so the seam's red run measures the actual
-	// finding before R1 moves the close to host shutdown.
+	// The input adapter is created lazily on the first session and lives as
+	// long as the host process: the adapter is closed exactly once, at
+	// shutdown, by inputOwnership.close (F5). The wiring is extracted from
+	// run()'s former inline block as inputOwnership so adapter lifetime is
+	// covered by tests of the production path (AC-5).
 	ownership := newInputOwnership()
 	cfg.input = ownership.get
+	defer ownership.close()
 
 	ln, err := cfg.listen(ctx)
 	if err != nil {

@@ -33,6 +33,19 @@ type Framebuffer struct {
 
 func NewFramebuffer(limits protocol.Limits) *Framebuffer { return &Framebuffer{limits: limits} }
 
+// Reset drops all display state so the next connection starts with clean
+// generation and sequence accounting (F1). Each host service restarts its
+// generation at 1 per connection; retaining the previous session's generation
+// would reject every new DISPLAY_CONFIG as stale forever.
+func (f *Framebuffer) Reset() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.generation, f.frameSequence = 0, 0
+	f.width, f.height = 0, 0
+	f.pixels = nil
+	f.keyframeRequired = false
+}
+
 func (f *Framebuffer) Configure(config protocol.DisplayConfig) error {
 	if err := protocol.ValidateMessage(config, f.limits); err != nil {
 		return err
