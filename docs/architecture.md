@@ -77,7 +77,7 @@ All protocol integers are unsigned big-endian unless explicitly signed. Each rec
 | length | 4 | payload bytes |
 | sequence | 8 | monotonically increasing per direction |
 
-Readers consume the fixed header first, reject invalid magic/version/type/flags/sequence/length, and only then allocate a bounded payload. Maximum control or input payload is 64 KiB. Maximum pixel-update payload is configurable and hard-capped at 16 MiB. Display dimensions are independently capped at 8192 by 8192 and checked with overflow-safe arithmetic. Unknown message types, wrong-direction messages, malformed payloads, replayed/out-of-order sequence numbers, or limit violations terminate the connection with a generic protocol error when safe to send.
+Readers consume the fixed header first, reject invalid magic/version/type/flags/sequence/length, and only then allocate a bounded payload. Maximum control or input payload is 64 KiB. Maximum pixel-update payload is configurable and hard-capped at 16 MiB. Display dimensions are independently capped at 8192 by 8192 and checked with overflow-safe arithmetic (hard limits in `internal/protocol/types.go`). Unknown message types, wrong-direction messages, malformed payloads, replayed/out-of-order sequence numbers, or limit violations terminate the connection with a generic protocol error when safe to send.
 
 The protocol major is negotiated by `CLIENT_HELLO` and `SERVER_HELLO`; the only MVP-supported value is 1. No common version causes clean rejection. Minor-compatible features are represented by a known capability bitset; peers reject required unknown capabilities and ignore no fields implicitly.
 
@@ -94,7 +94,7 @@ The state machine is:
 
 Messages invalid for the current state are protocol errors. One read loop and one write loop own the connection; other goroutines communicate through bounded typed queues. Any fatal read, write, authentication, capture, injection, or context error cancels the whole session. Idle sessions exchange `PING`/`PONG`; no valid message for 30 seconds causes a ping, and no response within 30 seconds closes the session. (Both values default to 30 s via `--heartbeat-interval` / `--heartbeat-timeout`; see `cmd/vdhost/main.go`.) Exact timeout values are configuration with these defaults and bounded minimums.
 
-The client bounds the entire initial connect sequence — dial, TLS handshake, authentication, and `CLIENT_HELLO`/`SERVER_HELLO` negotiation — with a configurable `--connect-timeout` (default `0` = no limit). When the deadline is exhausted the client stops reconnecting instead of looping against a dead host.
+The client bounds the entire initial connect sequence — dial, TLS handshake, authentication, and `CLIENT_HELLO`/`SERVER_HELLO` negotiation — with a configurable `--connect-timeout` (default `0` = no limit; see `cmd/vdclient/main.go`). When the deadline is exhausted the client stops reconnecting instead of looping against a dead host.
 
 Disconnect MUST release all remotely pressed keys and pointer buttons to avoid stuck input. A new connection starts with a keyframe and no inherited input state. The host rejects a second authenticated connection as busy; it does not evict the active client.
 
@@ -125,13 +125,13 @@ Rectangles MUST be non-empty, within the advertised display, non-overlapping wit
 
 ### 6.3 Changed-region strategy
 
-The host partitions the capture into 64 by 64 pixel tiles (edge tiles may be smaller), computes a fast content hash, and byte-compares tiles whose hash changed before declaring them dirty. Adjacent dirty tiles on the same tile rows are coalesced, then vertically merged only when their horizontal spans match. If coalescing would exceed 256 rectangles, or dirty pixels exceed 60% of the display, send one full-screen keyframe. Send a periodic keyframe at least every 10 seconds to bound recovery and hash-collision impact.
+The host partitions the capture into 64 by 64 pixel tiles (edge tiles may be smaller), computes a fast content hash, and byte-compares tiles whose hash changed before declaring them dirty. Adjacent dirty tiles on the same tile rows are coalesced, then vertically merged only when their horizontal spans match. If coalescing would exceed 256 rectangles, or dirty pixels exceed 60% of the display, send one full-screen keyframe. Send a periodic keyframe at least every 10 seconds (`--keyframe-interval`, see `cmd/vdhost/main.go`) to bound recovery and hash-collision impact.
 
 Correctness does not depend solely on the non-cryptographic hash: candidate changes are confirmed by byte comparison, and periodic keyframes repair any lost logical synchronization.
 
 ### 6.4 Backpressure and frame pacing
 
-Capture is sampled at a configurable target capped at 30 frames per second for the MVP. There is one pending-frame slot between capture/encoding and the network writer, with a total encoded update cap of 16 MiB. The writer never blocks capture while holding capture resources.
+Capture is sampled at a configurable target capped at 30 frames per second by `--capture-interval` (see `cmd/vdhost/main.go`) for the MVP. There is one pending-frame slot between capture/encoding and the network writer, with a total encoded update cap of 16 MiB. The writer never blocks capture while holding capture resources.
 
 If a newer update arrives while an unsent delta is pending, replace the pending delta with a newly generated keyframe representing the latest complete framebuffer. Never send a delta whose base was dropped. After any write timeout, queue overflow that cannot be represented by the one-slot latest state, or resolution change, discard queued deltas and force the next transmitted visual update to be a keyframe. Control shutdown/error messages use a separate small bounded queue but cannot grow without limit or indefinitely starve visual updates.
 
