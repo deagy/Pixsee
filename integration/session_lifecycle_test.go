@@ -241,25 +241,30 @@ func establishSilentClient(ctx context.Context, clientTLS *tls.Config, token [32
 }
 
 // TestIdleSoakSurvivesQuietSession asserts AC-3: with the test-parameterized
-// short heartbeat flags (interval 4s, timeout 4s, per spec D3) a session must
+// short heartbeat flags (interval 4s, timeout 6s, per spec D3) a session must
 // survive at least 2x(HeartbeatInterval+HeartbeatTimeout) while BOTH sides are
 // quiet — the client sends zero input events and the host streams a static
 // screen (no frames after the initial keyframe). Control-plane keepalive
 // (PING/PONG) is the only traffic allowed to cross.
 //
-// This is the acceptance trap for F2: at f7bb427 the documented PING keepalive
-// is dead code in this configuration — the host's heartbeat loop reaches its
-// give-up threshold at HeartbeatTimeout without the client ever having a
-// reason to be heard from, and the client side neither probes nor survives
-// quiet reads. The test must NOT keep the session alive by typing or by
-// changing the captured image.
+// This is the acceptance trap for F2: at f7bb427 the keepalive cannot save a
+// quiet session — the baseline host probes only on its full-interval tick and
+// the client never probes at all, so the gaps between host PINGs exceed the
+// client's per-Receive IOTimeout and the read deadline tears the session down
+// (and the baseline watchdog reaps it soon after). The test must NOT keep the
+// session alive by typing or by changing the captured image.
 func TestIdleSoakSurvivesQuietSession(t *testing.T) {
-	// D3 short flags. 4s/4s (rather than the spec's 2s example) doubles the
-	// PONG tolerance for a test box that may be loaded; the invariant and the
-	// failure mechanism are identical and the soak stays under the 30s budget.
+	// D3 short flags. interval < timeout so the watchdog's probe-and-give-up
+	// windows (and the client's PONG tolerance) sit strictly inside the read
+	// deadlines: a healthy round-trip can never be starved into a false reap
+	// by -race scheduling jitter, while at the baseline commit the same flags
+	// still kill the quiet session (re-verified red at the R0 tree with these
+	// exact values: the client's 5s per-Receive deadline expires in the
+	// baseline's ~8s probe gaps). The 2x invariant soak (20s) stays under
+	// D3's 30s budget.
 	const (
 		heartbeatInterval = 4 * time.Second
-		heartbeatTimeout  = 4 * time.Second
+		heartbeatTimeout  = 6 * time.Second
 	)
 	soak := 2 * (heartbeatInterval + heartbeatTimeout)
 
@@ -342,6 +347,16 @@ func TestIdleSoakSurvivesQuietSession(t *testing.T) {
 	}
 	if renderer.count() != 1 {
 		t.Fatalf("client presented %d snapshots for a static screen, want 1", renderer.count())
+	}
+	// What DID cross the wire is the documented keepalive: the host probed
+	// the silence with PING and the client answered with PONG. Survival with
+	// zero control traffic would mean the read deadline is doing the work by
+	// accident, not the heartbeat (F2's dead-code probe must be alive).
+	if n := log1.hostKinds()["PING"]; n < 1 {
+		t.Fatal("host sent no keepalive PING during the idle soak (F2: dead-code keepalive)")
+	}
+	if n := log1.clientKinds()["PONG"]; n < 1 {
+		t.Fatal("client never answered a keepalive PING with a PONG")
 	}
 
 	select {
@@ -457,15 +472,16 @@ func TestHeartbeatWatchdogProbesSilentPeer(t *testing.T) {
 func TestClientKeepaliveProbesIdleHost(t *testing.T) {
 	const (
 		clientHeartbeatInterval = 4 * time.Second
-		clientHeartbeatTimeout  = 4 * time.Second
+		clientHeartbeatTimeout  = 6 * time.Second
 		hostHeartbeatInterval   = 30 * time.Second
 		hostHeartbeatTimeout    = 30 * time.Second
 	)
-	// Watch 8s: long enough for several client PING ticks (interval/2 = 2s),
-	// comfortably inside the steady-state read deadline (4+4+5 = 13s) so the
-	// only way this passes is the client-initiated probe keeping the host
-	// responsive. (The 2x quiet-window invariant itself is asserted by
-	// TestIdleSoakSurvivesQuietSession.)
+	// Watch 8s: long enough for the first client PING tick (interval/2 = 2s)
+	// with a generous watchdog margin (give-up requires a 6s-unanswered
+	// probe), comfortably inside the steady-state read deadline (4+6+5 =
+	// 15s), so the only way this passes is the client-initiated probe keeping
+	// the host responsive. (The 2x quiet-window invariant itself is asserted
+	// by TestIdleSoakSurvivesQuietSession.)
 	soak := 8 * time.Second
 
 	ctx, cancel := context.WithTimeout(context.Background(), soak+30*time.Second)
@@ -533,9 +549,11 @@ func TestClientKeepaliveProbesIdleHost(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	if n := log1.clientKinds()["PING"]; n < 1 {
-		t.Fatal("client never sent an unsolicited PING while idle; the D7 client-side keepalive is dead code")
-	}
+	// The client's first probe fires around interval/2 = 4s; poll for it
+	// (plus a tick of grace) rather than sampling exactly at the window edge.
+	waitFor(t, 10*time.Second, "client-initiated PING", func() bool {
+		return log1.clientKinds()["PING"] >= 1
+	})
 	if n := log1.hostKinds()["PONG"]; n < 1 {
 		t.Fatal("host never answered the client's PING with a PONG")
 	}

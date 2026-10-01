@@ -74,8 +74,16 @@ type Service struct {
 	// pingNonce is a monotonic heartbeat nonce so each PING is distinguishable.
 	pingNonce uint64
 	// lastActivity is the last time any message arrived from the client; the
-	// heartbeat loop uses it to decide when to probe and when to give up.
+	// heartbeat loop uses it to decide when to probe.
 	lastActivity time.Time
+	// pendingPing marks an unanswered probe: sentAt is when the last PING went
+	// out and any message from the client clears it. The give-up branch fires
+	// only past a probe (D7: "no PONG within HeartbeatTimeout after a PING"),
+	// never on a session whose probes are being answered — the elapsed-since-
+	// activity formulation put the deadline exactly on the tick phase and let
+	// scheduling jitter kill healthy sessions.
+	pendingPing     bool
+	pendingPingSent time.Time
 }
 
 func NewService(config Config, capture Capture, input Input) *Service {
@@ -126,7 +134,7 @@ func (s *Service) Run(ctx context.Context, peer Peer) error {
 		return err
 	}
 	// Seed the heartbeat's activity clock so the first probe fires only after
-	// a full HeartbeatInterval of idle, not immediately on the zero time.
+	// half a HeartbeatInterval of idle, not immediately on the zero time.
 	s.recordActivity()
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -253,20 +261,24 @@ func (s *Service) inputLoop(ctx context.Context, peer Peer, errs chan<- error) {
 }
 
 // recordActivity stamps the last time any message arrived so the heartbeat
-// loop can tell a responsive peer from a silent one.
+// loop can tell a responsive peer from a silent one. Any message also answers
+// a pending PING probe (the watchdog only counts silence past a probe).
 func (s *Service) recordActivity() {
 	s.mu.Lock()
 	s.lastActivity = time.Now()
+	s.pendingPing = false
 	s.mu.Unlock()
 }
 
 // heartbeatLoop implements the idle-session watchdog described in
-// docs/architecture.md: once the peer has sent nothing for half the heartbeat
-// interval the host probes it with an unsolicited PING (spec D7: both sides
-// probe at HeartbeatInterval/2 of idle), and a peer silent for a full
-// HeartbeatTimeout is treated as gone. The probe fires on every tick while
-// the peer stays quiet, so a live peer's PONG — or any other traffic — keeps
-// resetting the give-up clock.
+// docs/architecture.md per remediation spec D7: once the peer has sent nothing
+// for half the heartbeat interval the host probes it with an unsolicited PING
+// (both sides probe at HeartbeatInterval/2 of idle), and a peer that stays
+// silent for a full HeartbeatTimeout after an unanswered probe is treated as
+// gone. Give-up is measured past the probe — not past the last activity on a
+// phase-aligned tick — so a peer whose PONGs keep arriving can never be
+// reaped by scheduling jitter, and the heartbeat watchdog (not the read
+// deadline) owns dead-peer detection.
 func (s *Service) heartbeatLoop(ctx context.Context, peer Peer, errs chan<- error) {
 	half := s.config.HeartbeatInterval / 2
 	if half <= 0 {
@@ -280,21 +292,28 @@ func (s *Service) heartbeatLoop(ctx context.Context, peer Peer, errs chan<- erro
 			return
 		case <-ticker.C:
 			s.mu.Lock()
-			elapsed := time.Since(s.lastActivity)
-			s.mu.Unlock()
-			if elapsed >= s.config.HeartbeatTimeout {
+			if s.pendingPing && time.Since(s.pendingPingSent) >= s.config.HeartbeatTimeout {
+				s.mu.Unlock()
 				report(errs, ErrHeartbeatTimeout)
 				return
 			}
-			if elapsed >= half {
-				s.mu.Lock()
+			probe := time.Since(s.lastActivity) >= half
+			var nonce uint64
+			if probe {
 				s.pingNonce++
-				nonce := s.pingNonce
-				s.mu.Unlock()
-				if err := peer.Send(ctx, protocol.Ping{Nonce: nonce}); err != nil {
-					report(errs, err)
-					return
+				nonce = s.pingNonce
+				if !s.pendingPing {
+					s.pendingPing = true
+					s.pendingPingSent = time.Now()
 				}
+			}
+			s.mu.Unlock()
+			if !probe {
+				continue
+			}
+			if err := peer.Send(ctx, protocol.Ping{Nonce: nonce}); err != nil {
+				report(errs, err)
+				return
 			}
 		}
 	}

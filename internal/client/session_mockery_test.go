@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,14 +60,13 @@ func TestSessionRunNotifiesObserverOnDialFailure(t *testing.T) {
 
 	var token [32]byte
 	token[0] = 1
-	dialCalls := 0
+	var dialCalls atomic.Int32
 	session, err := client.NewSession(client.Config{
 		Token:          token,
 		TLSConfig:      minimalTLSConfig(),
 		ReconnectDelay: time.Millisecond,
 		Dial: func(context.Context) (net.Conn, error) {
-			dialCalls++
-			if dialCalls >= 2 {
+			if dialCalls.Add(1) >= 2 {
 				cancel()
 			}
 			return nil, assert.AnError
@@ -77,7 +77,7 @@ func TestSessionRunNotifiesObserverOnDialFailure(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- session.Run(ctx) }()
 
-	require.Eventually(t, func() bool { return dialCalls >= 2 }, 2*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return dialCalls.Load() >= 2 }, 2*time.Second, time.Millisecond)
 	err = <-done
 	assert.ErrorIs(t, err, context.Canceled)
 	renderer.AssertNotCalled(t, "Present", mock.Anything)
