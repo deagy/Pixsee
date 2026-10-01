@@ -21,8 +21,9 @@ supporting flags, environment variables, and YAML config files.
 ## Requirements
 
 - Go (see the `go` directive in `go.mod` for the minimum version).
-- Linux: X11. Windows and macOS builds use native capture/input APIs
-  (see `docs/architecture.md`).
+- Linux: X11. Windows and macOS builds use native input adapters
+  (X11, SendInput, CoreGraphics) and the cross-platform `screenshot`
+  capture library (see `docs/architecture.md`).
 
 ## Building
 
