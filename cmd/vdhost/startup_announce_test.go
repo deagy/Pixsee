@@ -191,8 +191,15 @@ func TestVdhostAnnouncesEphemeralCertFingerprint(t *testing.T) {
 			}
 			all = append(all, line)
 			if m := fingerprintLineRE.FindStringSubmatch(line); m != nil {
-				if !strings.Contains(strings.ToLower(strings.Join(all, "\n")), "-fingerprint") {
+				joined := strings.ToLower(strings.Join(all, "\n"))
+				if !strings.Contains(joined, "-fingerprint") {
 					t.Fatalf("fingerprint announcement %q does not reference the client -fingerprint flag (AC-7)", line)
+				}
+				// D5: the explicit tokenless opt-in must be named loudly at
+				// startup — the warning line precedes the announcement in the
+				// accumulated output.
+				if !strings.Contains(joined, "warning") || !strings.Contains(joined, "-no-auth") {
+					t.Fatalf("tokenless startup must print a loud warning naming the -no-auth opt-in (D5); output=%q", strings.Join(all, " | "))
 				}
 				return
 			}
