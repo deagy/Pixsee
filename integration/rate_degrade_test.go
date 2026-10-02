@@ -26,50 +26,20 @@ import (
 
 	"virtualdesktop/internal/client"
 	"virtualdesktop/internal/host"
-	"virtualdesktop/internal/protocol"
-	"virtualdesktop/internal/transport"
 )
 
-// rateHostService runs a full host service (establishment + Service.Run)
-// with an explicit input rate limit, mirroring the production wiring.
+// rateHostService runs a full host service with an explicit input rate
+// limit, mirroring the production wiring. Establishment is delegated to the
+// shared, shipped path via hostServiceWithConfig (AC-9).
 func rateHostService(ctx context.Context, conn net.Conn, serverTLS *tls.Config, token [32]byte, cap *fakeCapture, input *recordingInput, log *messageLog, maxInputEventsPerSecond int) (*host.Service, *recordingPeer, <-chan error) {
-	svc := host.NewService(host.Config{
+	return hostServiceWithConfig(ctx, conn, serverTLS, token, cap, input, log, host.Config{
 		CaptureInterval:         time.Millisecond,
 		KeyframeInterval:        time.Hour,
 		MaxInputEventsPerSecond: maxInputEventsPerSecond,
 		EnableInput:             true,
 		HeartbeatInterval:       time.Hour, // no probes during this test window
 		HeartbeatTimeout:        time.Hour,
-	}, cap, input)
-	serverConn := tls.Server(conn, serverTLS.Clone())
-	if err := transport.Handshake(ctx, serverConn, 5*time.Second); err != nil {
-		errc := make(chan error, 1)
-		errc <- err
-		return svc, nil, errc
-	}
-	peer := recordingPeer{Peer: transport.NewPeerConn(serverConn, conn, protocol.RoleHost, protocol.DefaultLimits(), 5*time.Second), log: log}
-	if err := peer.AuthenticateHost(ctx, token); err != nil {
-		errc := make(chan error, 1)
-		errc <- err
-		return svc, nil, errc
-	}
-	if _, err := peer.Receive(ctx); err != nil {
-		errc := make(chan error, 1)
-		errc <- err
-		return svc, nil, errc
-	}
-	if err := peer.Send(ctx, protocol.ServerHello{Version: protocol.Version1}); err != nil {
-		errc := make(chan error, 1)
-		errc <- err
-		return svc, nil, errc
-	}
-	runCtx, cancel := context.WithCancel(ctx)
-	errc := make(chan error, 1)
-	go func() {
-		defer cancel()
-		errc <- svc.Run(runCtx, &peer)
-	}()
-	return svc, &peer, errc
+	})
 }
 
 func TestInputRateOverrunDropsEventsButKeepsSession(t *testing.T) {

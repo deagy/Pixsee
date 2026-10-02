@@ -23,6 +23,7 @@ import (
 	"virtualdesktop/internal/damage"
 	"virtualdesktop/internal/host"
 	"virtualdesktop/internal/protocol"
+	"virtualdesktop/internal/session"
 	"virtualdesktop/internal/transport"
 
 	"virtualdesktop/internal/host/capture"
@@ -151,26 +152,20 @@ func startHost(t *testing.T, ctx context.Context, serverTLS *tls.Config, token [
 			MaxInputEventsPerSecond: 1000,
 			EnableInput:             true,
 		}, cap, input)
-		serverConn := tls.Server(conn, serverTLS.Clone())
-		if err := transport.Handshake(ctx, serverConn, 5*time.Second); err != nil {
+		// AC-9: the e2e demo also rides the shipped establishment path.
+		established, err := session.Accept(ctx, conn, session.Config{
+			Token:     token,
+			TLSConfig: serverTLS,
+			Limits:    protocol.DefaultLimits(),
+			IOTimeout: 5 * time.Second,
+		})
+		if err != nil {
 			_ = conn.Close()
 			return
 		}
-		peer := transport.NewPeerConn(serverConn, conn, protocol.RoleHost, protocol.DefaultLimits(), 5*time.Second)
-		if err := peer.AuthenticateHost(ctx, token); err != nil {
-			_ = conn.Close()
-			return
-		}
-		if _, err := peer.Receive(ctx); err != nil {
-			_ = conn.Close()
-			return
-		}
-		_ = peer.Send(ctx, protocol.ServerHello{Version: protocol.Version1})
-		runCtx, cancel := context.WithCancel(ctx)
-		go func() {
-			defer cancel()
-			_ = svc.Run(runCtx, peer)
-		}()
+		defer established.Release()
+		defer func() { _ = established.Peer.Close() }()
+		_ = svc.Run(ctx, established.Peer)
 	}()
 	return ln.Addr().String(), func() { _ = ln.Close() }
 }

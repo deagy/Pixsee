@@ -12,6 +12,7 @@ import (
 	"virtualdesktop/internal/client"
 	"virtualdesktop/internal/host"
 	"virtualdesktop/internal/protocol"
+	"virtualdesktop/internal/session"
 	"virtualdesktop/internal/transport"
 )
 
@@ -33,7 +34,9 @@ func TestReconnectAfterDisconnect(t *testing.T) {
 	}
 	defer ln.Close()
 
-	// Persistent host: accept up to two connections.
+	// Persistent host: accept up to two connections. Each goes through the
+	// SHIPPED establishment path (session.Accept) and is then closed to force
+	// a client reconnect (AC-9: no harness-only handshake anymore).
 	go func() {
 		for i := 0; i < 2; i++ {
 			conn, err := ln.Accept()
@@ -41,23 +44,16 @@ func TestReconnectAfterDisconnect(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
-				serverConn := tls.Server(c, serverTLS.Clone())
-				if err := transport.Handshake(ctx, serverConn, 5*time.Second); err != nil {
+				established, err := session.Accept(ctx, c, session.Config{
+					Token:     token,
+					TLSConfig: serverTLS,
+					IOTimeout: 5 * time.Second,
+				})
+				if err != nil {
 					return
 				}
-				peer := transport.NewPeerConn(serverConn, c, protocol.RoleHost, protocol.DefaultLimits(), 5*time.Second)
-				if err := peer.AuthenticateHost(ctx, token); err != nil {
-					return
-				}
-				if _, err := peer.Receive(ctx); err != nil {
-					return
-				}
-				if err := peer.Send(ctx, protocol.ServerHello{Version: protocol.Version1}); err != nil {
-					return
-				}
-				// Close immediately after hello to force a client reconnect.
-				_ = c.Close()
+				established.Release()
+				_ = established.Peer.Close()
 			}(conn)
 		}
 	}()
@@ -94,38 +90,24 @@ func TestPingPongExchange(t *testing.T) {
 	}
 	defer ln.Close()
 
+	peers := make(chan *recordingPeer, 1)
+	svcExited := make(chan error, 1)
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		svc := host.NewService(host.Config{
+		// AC-9: shared establishment path (internal/session.Accept).
+		_, peer, errc := hostServiceWithConfig(ctx, conn, serverTLS, token, cap, input, log, host.Config{
 			CaptureInterval:         time.Millisecond,
 			KeyframeInterval:        time.Hour,
 			MaxInputEventsPerSecond: 1000,
 			EnableInput:             true,
-		}, cap, input)
-		serverConn := tls.Server(conn, serverTLS.Clone())
-		if err := transport.Handshake(ctx, serverConn, 5*time.Second); err != nil {
-			return
+		})
+		if peer != nil {
+			peers <- peer
 		}
-		peer := recordingPeer{Peer: transport.NewPeerConn(serverConn, conn, protocol.RoleHost, protocol.DefaultLimits(), 5*time.Second), log: log}
-		if err := peer.AuthenticateHost(ctx, token); err != nil {
-			return
-		}
-		if _, err := peer.Receive(ctx); err != nil {
-			return
-		}
-		if err := peer.Send(ctx, protocol.ServerHello{Version: protocol.Version1}); err != nil {
-			return
-		}
-		runCtx, cancel := context.WithCancel(ctx)
-		go func() {
-			defer cancel()
-			_ = svc.Run(runCtx, &peer)
-		}()
-		time.Sleep(50 * time.Millisecond)
-		_ = peer.Send(ctx, protocol.Ping{Nonce: 0x1234})
+		svcExited <- <-errc
 	}()
 
 	renderer := &snapshotRenderer{}
@@ -134,6 +116,9 @@ func TestPingPongExchange(t *testing.T) {
 	defer sess.Input().Disconnect()
 
 	waitFor(t, 5*time.Second, "initial keyframe", func() bool { return renderer.count() >= 1 })
+	peer := <-peers
+	_ = peer.Send(ctx, protocol.Ping{Nonce: 0x1234})
+
 	waitFor(t, 5*time.Second, "pong received by host", func() bool {
 		return log.clientKinds()["PONG"] >= 1
 	})

@@ -16,6 +16,7 @@ import (
 	"virtualdesktop/internal/damage"
 	"virtualdesktop/internal/host"
 	"virtualdesktop/internal/protocol"
+	"virtualdesktop/internal/session"
 	"virtualdesktop/internal/transport"
 )
 
@@ -219,45 +220,44 @@ func solidPixels(w, h uint32, color byte) []byte {
 	return p
 }
 
-// hostService runs a real host.Service against a single client connection. It
-// performs the handshake, authentication, and hello exchange that the service
-// itself does not, then runs the service. It returns the service, the
-// recording peer, and a channel that receives the service's exit error.
+// hostService runs a real host.Service against a single client connection.
+// Establishment (TLS accept, AUTH, busy admission, HELLO) is delegated to
+// hostServiceWithConfig, which drives internal/session.Accept — the SAME code
+// the shipped host runs (AC-9: the harness no longer re-implements the
+// handshake it used to duplicate here, F10).
 func hostService(ctx context.Context, conn net.Conn, serverTLS *tls.Config, token [32]byte, cap *fakeCapture, input *recordingInput, log *messageLog) (*host.Service, *recordingPeer, <-chan error) {
-	svc := host.NewService(host.Config{
+	return hostServiceWithConfig(ctx, conn, serverTLS, token, cap, input, log, host.Config{
 		CaptureInterval:         time.Millisecond,
 		KeyframeInterval:        time.Hour,
 		MaxInputEventsPerSecond: 1000,
 		EnableInput:             true,
-	}, cap, input)
-	serverConn := tls.Server(conn, serverTLS.Clone())
-	if err := transport.Handshake(ctx, serverConn, 5*time.Second); err != nil {
-		errc := make(chan error, 1)
-		errc <- err
-		return svc, nil, errc
-	}
-	peer := recordingPeer{Peer: transport.NewPeerConn(serverConn, conn, protocol.RoleHost, protocol.DefaultLimits(), 5*time.Second), log: log}
-	if err := peer.AuthenticateHost(ctx, token); err != nil {
-		errc := make(chan error, 1)
-		errc <- err
-		return svc, nil, errc
-	}
-	// Hello exchange: receive ClientHello, then send ServerHello.
-	if _, err := peer.Receive(ctx); err != nil {
-		errc := make(chan error, 1)
-		errc <- err
-		return svc, nil, errc
-	}
-	if err := peer.Send(ctx, protocol.ServerHello{Version: protocol.Version1}); err != nil {
-		errc := make(chan error, 1)
-		errc <- err
-		return svc, nil, errc
-	}
-	runCtx, cancel := context.WithCancel(ctx)
+	})
+}
+
+// hostServiceWithConfig is the ONE host-side test establishment path: it
+// accepts the inbound connection through session.Accept, wraps the resulting
+// peer for message logging, and runs host.Service on it. Returns the service,
+// the recording peer, and a channel receiving the service's exit error.
+func hostServiceWithConfig(ctx context.Context, conn net.Conn, serverTLS *tls.Config, token [32]byte, cap *fakeCapture, input *recordingInput, log *messageLog, cfg host.Config) (*host.Service, *recordingPeer, <-chan error) {
+	svc := host.NewService(cfg, cap, input)
 	errc := make(chan error, 1)
+	established, err := session.Accept(ctx, conn, session.Config{
+		Token:     token,
+		TLSConfig: serverTLS,
+		Limits:    protocol.DefaultLimits(),
+		IOTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		errc <- err
+		return svc, nil, errc
+	}
+	peer := &recordingPeer{Peer: established.Peer, log: log}
+	runCtx, cancel := context.WithCancel(ctx)
 	go func() {
 		defer cancel()
-		errc <- svc.Run(runCtx, &peer)
+		defer established.Release()
+		defer func() { _ = established.Peer.Close() }()
+		errc <- svc.Run(runCtx, peer)
 	}()
-	return svc, &peer, errc
+	return svc, peer, errc
 }

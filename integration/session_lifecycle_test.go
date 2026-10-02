@@ -158,6 +158,24 @@ func TestOracleFullSessionReconnect(t *testing.T) {
 			keysArrived = n >= 1
 		}
 	}
+
+	// N2 (R3): the full DOWN/UP pair must survive the reconnect, not just the
+	// first event — a key release has to reach the host too.
+	if err := sess.Input().Key(0x04, protocol.ActionUp, 0); err != nil {
+		t.Fatalf("Key UP after reconnect: %v", err)
+	}
+	upArrived := false
+	uld := time.After(10 * time.Second)
+	for !upArrived {
+		select {
+		case <-uld:
+			n, _ := in2.snapshot()
+			t.Fatalf("key UP did not reach the host after reconnect: host2 received %d key events (DOWN/UP pair incomplete)", n)
+		case <-time.After(10 * time.Millisecond):
+			n, _ := in2.snapshot()
+			upArrived = n >= 2
+		}
+	}
 	cancel()
 	<-done
 }
@@ -165,45 +183,17 @@ func TestOracleFullSessionReconnect(t *testing.T) {
 // quietHostService runs a real host.Service like hostService, but with the
 // given heartbeat configuration (spec D3: behavior tests drive the real
 // config surface, here host.Config's heartbeat fields, which cmd/vdhost wires
-// from -heartbeat-interval/-heartbeat-timeout).
+// from -heartbeat-interval/-heartbeat-timeout). Establishment is delegated to
+// the shared, shipped path via hostServiceWithConfig (AC-9).
 func quietHostService(ctx context.Context, conn net.Conn, serverTLS *tls.Config, token [32]byte, cap *fakeCapture, input *recordingInput, log *messageLog, heartbeatInterval, heartbeatTimeout time.Duration) (*host.Service, *recordingPeer, <-chan error) {
-	svc := host.NewService(host.Config{
+	return hostServiceWithConfig(ctx, conn, serverTLS, token, cap, input, log, host.Config{
 		CaptureInterval:         time.Millisecond,
 		KeyframeInterval:        time.Hour,
 		MaxInputEventsPerSecond: 1000,
 		EnableInput:             true,
 		HeartbeatInterval:       heartbeatInterval,
 		HeartbeatTimeout:        heartbeatTimeout,
-	}, cap, input)
-	serverConn := tls.Server(conn, serverTLS.Clone())
-	if err := transport.Handshake(ctx, serverConn, 5*time.Second); err != nil {
-		errc := make(chan error, 1)
-		errc <- err
-		return svc, nil, errc
-	}
-	peer := recordingPeer{Peer: transport.NewPeerConn(serverConn, conn, protocol.RoleHost, protocol.DefaultLimits(), 5*time.Second), log: log}
-	if err := peer.AuthenticateHost(ctx, token); err != nil {
-		errc := make(chan error, 1)
-		errc <- err
-		return svc, nil, errc
-	}
-	if _, err := peer.Receive(ctx); err != nil {
-		errc := make(chan error, 1)
-		errc <- err
-		return svc, nil, errc
-	}
-	if err := peer.Send(ctx, protocol.ServerHello{Version: protocol.Version1}); err != nil {
-		errc := make(chan error, 1)
-		errc <- err
-		return svc, nil, errc
-	}
-	runCtx, cancel := context.WithCancel(ctx)
-	errc := make(chan error, 1)
-	go func() {
-		defer cancel()
-		errc <- svc.Run(runCtx, &peer)
-	}()
-	return svc, &peer, errc
+	})
 }
 
 // establishSilentClient completes the full client-side establishment against

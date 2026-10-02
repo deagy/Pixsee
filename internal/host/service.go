@@ -35,6 +35,12 @@ type Input interface {
 type Peer interface {
 	Send(context.Context, protocol.Message) error
 	Receive(context.Context) (protocol.Message, error)
+	// SetSteadyReadTimeout arms the heartbeat-derived read deadline that the
+	// implementation applies once the session reaches Active (spec D7). It is
+	// part of the contract so a future wrapper cannot silently regress F2 by
+	// dropping the method; host.Service.Run keeps a runtime assertion as
+	// defence in depth.
+	SetSteadyReadTimeout(time.Duration)
 }
 
 type Config struct {
@@ -139,9 +145,9 @@ func (s *Service) Run(ctx context.Context, peer Peer) error {
 	// heartbeat config so the heartbeat watchdog — not a short per-operation
 	// I/O deadline — owns dead-peer detection. Establishment reads keep the
 	// peer's IOTimeout until the first DISPLAY_CONFIG flips the session to
-	// Active. The arming is MANDATORY (verifier follow-on N1): a peer that
-	// does not implement SetSteadyReadTimeout would silently regress F2, so
-	// Run refuses to start the session instead of skipping the arming.
+	// Active. SetSteadyReadTimeout is part of the Peer contract (O2), so the
+	// type assertion below is a runtime belt for dynamically-wrapped peers;
+	// it refuses the session rather than silently skipping the arming (N1).
 	setter, ok := peer.(interface{ SetSteadyReadTimeout(time.Duration) })
 	if !ok {
 		return fmt.Errorf("host service: peer %T does not implement SetSteadyReadTimeout; steady-state read deadlines must derive from the heartbeat config (F2/D7)", peer)

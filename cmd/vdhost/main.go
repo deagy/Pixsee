@@ -30,6 +30,7 @@ import (
 	"virtualdesktop/internal/host/capture"
 	"virtualdesktop/internal/host/input"
 	"virtualdesktop/internal/protocol"
+	"virtualdesktop/internal/session"
 	"virtualdesktop/internal/transport"
 )
 
@@ -195,31 +196,11 @@ type appConfig struct {
 	ephemeralCert   bool
 	certFingerprint [sha256.Size]byte
 
-	// sessionMu guards the single-active-session admission control. The host
-	// permits exactly one active client session at a time (docs §3, §5); a
-	// second authenticated connection is rejected with ERROR_BUSY instead of
-	// being accepted and leaking a goroutine.
-	sessionMu   sync.Mutex
-	sessionOpen bool
-}
-
-// admitSession claims the single active session. It returns false when a
-// session is already open, in which case the caller must reject the connection
-// as busy. releaseSession must be called when the session ends.
-func (c *appConfig) admitSession() bool {
-	c.sessionMu.Lock()
-	defer c.sessionMu.Unlock()
-	if c.sessionOpen {
-		return false
-	}
-	c.sessionOpen = true
-	return true
-}
-
-func (c *appConfig) releaseSession() {
-	c.sessionMu.Lock()
-	defer c.sessionMu.Unlock()
-	c.sessionOpen = false
+	// admissions carries the single-active-session policy into
+	// internal/session.Accept. The host permits exactly one active client
+	// session at a time (docs §3, §5); a second authenticated connection is
+	// rejected with ERROR_BUSY by the shared establishment path (F10/AC-9).
+	admissions *session.Admissions
 }
 
 // inputOwnership lazily creates the platform input adapter and owns closing
@@ -384,6 +365,7 @@ func buildConfigFromViper(v *viper.Viper) (*appConfig, error) {
 		var d net.ListenConfig
 		return d.Listen(ctx, "tcp", addr)
 	}
+	cfg.admissions = &session.Admissions{}
 	return cfg, nil
 }
 
@@ -557,68 +539,24 @@ func run(cfg *appConfig) error {
 	}
 }
 
+// handleConnection owns one inbound connection end to end. Session
+// establishment itself (TLS accept, AUTH, busy admission, HELLO) lives in
+// internal/session and is shared verbatim with the integration harness
+// (F10/AC-9); this function is pure wiring: accept, adapters, service.
 func handleConnection(ctx context.Context, cfg *appConfig, conn net.Conn) {
-	tlsConn := tls.Server(conn, cfg.tlsConfig.Clone())
-	if err := transport.Handshake(ctx, tlsConn, cfg.ioTimeout); err != nil {
-		_ = conn.Close()
-		fmt.Fprintf(os.Stderr, "vdhost: handshake: %v\n", err)
-		return
-	}
-	peer := transport.NewPeerConn(tlsConn, conn, protocol.RoleHost, protocol.DefaultLimits(), cfg.ioTimeout)
-	if err := peer.AuthenticateHost(ctx, cfg.token); err != nil {
-		_ = conn.Close()
-		fmt.Fprintf(os.Stderr, "vdhost: authentication failed: %v\n", err)
-		return
-	}
-	fmt.Printf("vdhost: client authenticated from %s\n", conn.RemoteAddr())
-
-	// The host permits exactly one active client session (docs §3, §5). A
-	// second authenticated connection is rejected with ERROR_BUSY and closed
-	// before it can enter the service loop and leak a goroutine.
-	if !cfg.admitSession() {
-		if err := peer.Send(ctx, protocol.ErrorMessage{
-			Code:       protocol.ErrorBusy,
-			Diagnostic: "another client already holds the session",
-		}); err != nil {
-			_ = conn.Close()
-			fmt.Fprintf(os.Stderr, "vdhost: busy: send error: %v\n", err)
-			return
-		}
-		_ = conn.Close()
-		return
-	}
-	defer cfg.releaseSession()
-
-	// Negotiating: the client sends CLIENT_HELLO and the host replies with
-	// SERVER_HELLO before any DISPLAY_CONFIG/FRAME traffic. Without this
-	// exchange the peer's session state machine stays in the Negotiating
-	// state and rejects the service's first DISPLAY_CONFIG send as invalid
-	// for the current state, closing the connection; the client then times
-	// out waiting for SERVER_HELLO and reconnects forever with no display
-	// ever appearing. See docs/architecture.md sections 5 and 8.
-	message, err := peer.Receive(ctx)
+	established, err := session.Accept(ctx, conn, session.Config{
+		Token:      cfg.token,
+		TLSConfig:  cfg.tlsConfig,
+		Limits:     protocol.DefaultLimits(),
+		IOTimeout:  cfg.ioTimeout,
+		Admissions: cfg.admissions,
+	})
 	if err != nil {
-		_ = conn.Close()
-		fmt.Fprintf(os.Stderr, "vdhost: hello: %v\n", err)
+		fmt.Fprintf(os.Stderr, "vdhost: %v\n", err)
 		return
 	}
-	hello, ok := message.(protocol.ClientHello)
-	if !ok {
-		_ = conn.Close()
-		fmt.Fprintf(os.Stderr, "vdhost: hello: expected CLIENT_HELLO, got %T\n", message)
-		return
-	}
-	version, err := protocol.NegotiateVersion(hello.MinVersion, hello.MaxVersion, protocol.Version1, protocol.Version1)
-	if err != nil {
-		_ = conn.Close()
-		fmt.Fprintf(os.Stderr, "vdhost: version negotiation: %v\n", err)
-		return
-	}
-	if err := peer.Send(ctx, protocol.ServerHello{Version: version}); err != nil {
-		_ = conn.Close()
-		fmt.Fprintf(os.Stderr, "vdhost: hello: %v\n", err)
-		return
-	}
+	defer established.Release()
+	fmt.Printf("vdhost: client authenticated from %s (protocol v%d)\n", conn.RemoteAddr(), established.Version)
 
 	input, err := cfg.input()
 	if err != nil {
@@ -636,7 +574,7 @@ func handleConnection(ctx context.Context, cfg *appConfig, conn net.Conn) {
 		HeartbeatInterval:       cfg.heartbeatInterval,
 		HeartbeatTimeout:        cfg.heartbeatTimeout,
 	}, cfg.capture, input)
-	if err := svc.Run(ctx, peer); err != nil {
+	if err := svc.Run(ctx, established.Peer); err != nil {
 		fmt.Fprintf(os.Stderr, "vdhost: session ended: %v\n", err)
 	}
 	_ = conn.Close()
