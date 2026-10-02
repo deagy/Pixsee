@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -13,9 +14,9 @@ import (
 )
 
 var (
-	ErrInvalidInput     = errors.New("invalid host input")
-	ErrInputDisabled    = fmt.Errorf("%w: input is disabled", ErrInvalidInput)
-	ErrInputRate        = fmt.Errorf("%w: rate limit exceeded", ErrInvalidInput)
+	ErrInvalidInput  = errors.New("invalid host input")
+	ErrInputDisabled = fmt.Errorf("%w: input is disabled", ErrInvalidInput)
+	// ErrHeartbeatTimeout is reported when the watchdog reaps a silent peer.
 	ErrHeartbeatTimeout = errors.New("no response to heartbeat")
 )
 
@@ -37,9 +38,12 @@ type Peer interface {
 }
 
 type Config struct {
-	DisplayID               uint32
-	CaptureInterval         time.Duration
-	KeyframeInterval        time.Duration
+	DisplayID        uint32
+	CaptureInterval  time.Duration
+	KeyframeInterval time.Duration
+	// MaxInputEventsPerSecond is the input rate limit. Exceeding it sheds
+	// events (counted via Service.InputDropped, one log line per burst)
+	// rather than terminating the session (F7/Q5).
 	MaxInputEventsPerSecond int
 	EnableInput             bool
 	Damage                  damage.Config
@@ -66,6 +70,13 @@ type Service struct {
 	lastInputSeq    uint64
 	rateWindowStart time.Time
 	rateCount       int
+	// rateDrops counts input events shed by the rate limiter (Q5: overrun
+	// degrades with a counted, logged signal instead of terminating the
+	// session — finding F7). Guarded by mu like the rest of the rate state.
+	rateDrops int64
+	// rateBurstActive marks an ongoing drop burst so exactly one log line is
+	// emitted per burst, never per event.
+	rateBurstActive bool
 	// keyframeRequested is set when the client sends a KEYFRAME_REQUEST (it
 	// received a delta it could not apply) and cleared the next time the send
 	// loop processes a capture, forcing that capture to be a full keyframe so
@@ -109,6 +120,15 @@ func NewService(config Config, capture Capture, input Input) *Service {
 		config.HeartbeatTimeout = 30 * time.Second
 	}
 	return &Service{config: config, capture: capture, input: input}
+}
+
+// InputDropped reports how many input events the rate limiter has shed since
+// the service started (Q5 telemetry for F7: overruns drop + count + one log
+// line per burst; the session survives).
+func (s *Service) InputDropped() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rateDrops
 }
 
 func (s *Service) Run(ctx context.Context, peer Peer) error {
@@ -371,9 +391,23 @@ func (s *Service) handleInput(ctx context.Context, peer Peer, message protocol.M
 		s.rateWindowStart, s.rateCount = now, 0
 	}
 	if s.rateCount >= s.config.MaxInputEventsPerSecond {
+		// Q5 (F7): a rate overrun is a DEGRADE, not a disconnect — a fast
+		// polling mouse legitimately exceeds the limit. Drop the event,
+		// count it, and log exactly one line at the start of each burst.
+		// Session termination stays reserved for protocol violations, which
+		// the checks above still enforce.
+		s.rateDrops++
+		firstOfBurst := !s.rateBurstActive
+		s.rateBurstActive = true
+		total := s.rateDrops
 		s.mu.Unlock()
-		return ErrInputRate
+		if firstOfBurst {
+			slog.Info("host: input rate limit exceeded, dropping events until the next rate window",
+				"limit_per_second", s.config.MaxInputEventsPerSecond, "total_dropped", total)
+		}
+		return nil
 	}
+	s.rateBurstActive = false // an accepted event ends any drop burst
 	width, height := s.width, s.height
 	s.rateCount++
 	s.lastInputSeq = sequence

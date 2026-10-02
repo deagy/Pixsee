@@ -11,6 +11,14 @@ itself; releases are tagged in git).
 
 ### Changed
 
+- **Input rate overrun degrades instead of disconnecting** (F7 / AC-10, owner
+  decision Q5). A client event burst above `-max-input-per-sec` now sheds the
+  excess events — counted via `host.Service.InputDropped()` and logged as one
+  line per drop burst — and the session stays Active streaming frames.
+  Previously any overrun returned `ErrInputRate` and terminated the whole
+  session, so a fast polling mouse could kill it; the exported
+  `host.ErrInputRate` is gone with that behavior. Termination remains
+  reserved for protocol violations.
 - **The host now fails closed without authentication material** (F4 / AC-6,
   owner decision Q2; supersedes the warning-only tokenless mode of v1.2.2).
   `vdhost` refuses to start with a zero token: a non-loopback bind always

@@ -220,16 +220,41 @@ func TestServiceRejectsStaleGenerationOutOfBoundsAndDisabledInput(t *testing.T) 
 	}
 }
 
-func TestServiceRateLimitsInput(t *testing.T) {
-	in := make(chan protocol.Message, 2)
+func TestServiceRateOverrunDropsAndCountsInsteadOfTerminating(t *testing.T) {
+	// Q5/F7: more events than the per-second limit must be shed with the
+	// drop counted, NOT reported as a fatal ErrInputRate (the old
+	// terminate-the-session behavior this replaces).
+	in := make(chan protocol.Message, 4)
 	in <- protocol.Key{Generation: 1, InputSequence: 1, Usage: 4, Action: protocol.ActionDown}
 	in <- protocol.Key{Generation: 1, InputSequence: 2, Usage: 4, Action: protocol.ActionUp}
+	in <- protocol.Key{Generation: 1, InputSequence: 3, Usage: 5, Action: protocol.ActionDown}
+	in <- protocol.Key{Generation: 1, InputSequence: 4, Usage: 5, Action: protocol.ActionUp}
 	cfg := testConfig()
 	cfg.MaxInputEventsPerSecond = 1
-	err := NewService(cfg, &fakeCapture{frames: []damage.Image{testImage(1)}}, &fakeInput{}).Run(context.Background(), &fakePeer{incoming: in})
-	if !errors.Is(err, ErrInputRate) {
-		t.Fatalf("error=%v", err)
+	svc := NewService(cfg, &fakeCapture{frames: []damage.Image{testImage(1)}}, &fakeInput{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- svc.Run(ctx, &fakePeer{incoming: in}) }()
+
+	deadline := time.After(3 * time.Second)
+	for svc.InputDropped() < 3 {
+		select {
+		case err := <-done:
+			t.Fatalf("service terminated on rate overrun (%v); Q5 requires dropping and counting instead", err)
+		case <-deadline:
+			t.Fatalf("dropped count = %d, want 3 (four events at a 1/s limit)", svc.InputDropped())
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
+	select {
+	case err := <-done:
+		t.Fatalf("service terminated while over the rate limit: %v", err)
+	default:
+	}
+	cancel()
+	<-done
 }
 
 func TestServicePropagatesCaptureSendAndInjectionErrors(t *testing.T) {

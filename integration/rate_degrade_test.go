@@ -15,9 +15,12 @@ package integration
 // counter API itself (N5 precedent from R2).
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"log/slog"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -92,6 +95,7 @@ func TestInputRateOverrunDropsEventsButKeepsSession(t *testing.T) {
 	cap1.setImage(8, 8, 0x10)
 	in1 := &recordingInput{}
 	log1 := &messageLog{}
+	svcs := make(chan *host.Service, 1)
 	svcExited := make(chan error, 1)
 	go func() {
 		c, err := ln.Accept()
@@ -99,7 +103,8 @@ func TestInputRateOverrunDropsEventsButKeepsSession(t *testing.T) {
 			svcExited <- err
 			return
 		}
-		_, _, errc := rateHostService(ctx, c, serverTLS, token, cap1, in1, log1, rateLimit)
+		svc, _, errc := rateHostService(ctx, c, serverTLS, token, cap1, in1, log1, rateLimit)
+		svcs <- svc
 		svcExited <- <-errc
 	}()
 
@@ -116,6 +121,13 @@ func TestInputRateOverrunDropsEventsButKeepsSession(t *testing.T) {
 	if err := sess.Input().SetFocused(true); err != nil {
 		t.Fatal(err)
 	}
+
+	// Capture the burst log signal: Q5 requires exactly ONE log line per
+	// burst, not per dropped event.
+	var logBuf bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	defer slog.SetDefault(prevLogger)
 
 	// The burst: limit + 50% pointer moves delivered well inside one rate
 	// window — exactly the traffic shape of a fast polling mouse (F7).
@@ -135,6 +147,15 @@ func TestInputRateOverrunDropsEventsButKeepsSession(t *testing.T) {
 	}
 	if state, ok := stateAfterConnected(observer); ok {
 		t.Fatalf("session regressed to state %v after a rate overrun; AC-10 requires staying Connected", state)
+	}
+
+	// Q5 telemetry: the drops are counted, and the burst was announced with
+	// exactly one log line (not per-event spam).
+	if dropped := (<-svcs).InputDropped(); dropped == 0 {
+		t.Fatal("AC-10: rate overrun must be counted via Service.InputDropped (Q5 counter)")
+	}
+	if n := strings.Count(logBuf.String(), "input rate limit exceeded"); n != 1 {
+		t.Fatalf("burst log lines = %d, want exactly 1 per burst (Q5); log=%q", n, logBuf.String())
 	}
 
 	// Liveness in both directions: the host must still stream a new frame
