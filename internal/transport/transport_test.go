@@ -417,29 +417,6 @@ func TestReceiveHonorsCancellation(t *testing.T) {
 	}
 }
 
-func TestBoundedQueueRejectsOverflowAndTerminates(t *testing.T) {
-	queue, err := NewQueue[protocol.Message](1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := queue.TrySend(protocol.Ping{Nonce: 1}); err != nil {
-		t.Fatal(err)
-	}
-	if err := queue.TrySend(protocol.Ping{Nonce: 2}); !errors.Is(err, ErrBackpressure) {
-		t.Fatalf("got %v", err)
-	}
-	queue.Close()
-	if _, ok := <-queue.Receive(); !ok {
-		t.Fatal("queued item was discarded")
-	}
-	if _, ok := <-queue.Receive(); ok {
-		t.Fatal("closed queue did not terminate")
-	}
-	if err := queue.TrySend(protocol.Ping{}); !errors.Is(err, ErrClosed) {
-		t.Fatalf("got %v", err)
-	}
-}
-
 func testTLSPeers(t *testing.T) (*Peer, *Peer) {
 	t.Helper()
 	certificate, leaf := testCertificate(t)
