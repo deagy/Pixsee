@@ -147,7 +147,7 @@ func TestDefaultDial(t *testing.T) {
 	}
 	defer ln.Close()
 
-	dial := defaultDial(ln.Addr().String(), nil)
+	dial := defaultDial(ln.Addr().String())
 	conn, err := dial(context.Background())
 	if err != nil {
 		t.Fatalf("dial: %v", err)

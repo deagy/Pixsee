@@ -278,7 +278,7 @@ func loadCAPool(path string) (*x509.CertPool, error) {
 	return roots, nil
 }
 
-func defaultDial(addr string, tlsConfig *tls.Config) func(context.Context) (net.Conn, error) {
+func defaultDial(addr string) func(context.Context) (net.Conn, error) {
 	return func(ctx context.Context) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, "tcp", addr)
@@ -298,7 +298,7 @@ func run(cfg *appConfig) error {
 
 	observer := &loggingObserver{}
 	if cfg.Dial == nil {
-		cfg.Dial = defaultDial(cfg.addr, cfg.tlsConfig)
+		cfg.Dial = defaultDial(cfg.addr)
 	}
 	session, err := client.NewSession(client.Config{
 		Token:          cfg.token,
