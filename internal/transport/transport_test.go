@@ -2,6 +2,8 @@ package transport
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -498,4 +500,84 @@ func testCertificate(t *testing.T) (tls.Certificate, *x509.Certificate) {
 		t.Fatal(err)
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}, leaf
+}
+
+// testEcdsaCertificate builds a self-signed ECDSA P-256 certificate for
+// "localhost" — the key type production EphemeralServerCertificate actually
+// uses. Unlike the RSA fixtures (KeyUsageKeyEncipherment), TLS 1.3 uses
+// ephemeral key exchange, so only DigitalSignature is valid for ECDSA.
+func testEcdsaCertificate(t *testing.T) (tls.Certificate, *x509.Certificate) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		DNSNames:              []string{"localhost"},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}, leaf
+}
+
+// TestEcdsaP256HandshakeAndAuth proves the TLS 1.3 handshake and the AUTH gate
+// work over an ECDSA P-256 certificate — the production key type. The RSA-2048
+// fixtures above exercise a different key path, so without this the actual
+// production certificate type is never validated end-to-end.
+func TestEcdsaP256HandshakeAndAuth(t *testing.T) {
+	cert, leaf := testEcdsaCertificate(t)
+	serverConfig, err := ServerTLSConfig(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConfig, err := ClientTLSConfigForCertificate("localhost", leaf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverRaw, clientRaw := net.Pipe()
+	serverTLS := tls.Server(serverRaw, serverConfig)
+	clientTLS := tls.Client(clientRaw, clientConfig)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var token [32]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		t.Fatal(err)
+	}
+	serverResult := make(chan error, 1)
+	go func() {
+		if err := Handshake(ctx, serverTLS, time.Second); err != nil {
+			serverResult <- err
+			return
+		}
+		peer := NewPeer(serverTLS, protocol.RoleHost, protocol.DefaultLimits(), time.Second)
+		serverResult <- peer.AuthenticateHost(ctx, token)
+	}()
+
+	if err := Handshake(ctx, clientTLS, time.Second); err != nil {
+		t.Fatalf("ecdsa client handshake failed: %v", err)
+	}
+	client := NewPeer(clientTLS, protocol.RoleClient, protocol.DefaultLimits(), time.Second)
+	if err := client.AuthenticateClient(ctx, token); err != nil {
+		t.Fatalf("ecdsa client auth failed: %v", err)
+	}
+	if err := <-serverResult; err != nil {
+		t.Fatalf("ecdsa server auth failed: %v", err)
+	}
 }
