@@ -498,7 +498,16 @@ func buildTLSConfig(caPath, keyPath string) (*tls.Config, error) {
 func run(cfg *appConfig) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	return serve(ctx, cfg)
+}
 
+// serve runs the host until ctx is canceled: it wires the platform adapters,
+// opens the listener, and accepts connections. Cancellation must both unblock
+// the blocking Accept and leave no listener behind, so serve registers a
+// context callback that closes the listener when ctx is done. Signal handling
+// itself stays in run, keeping this shutdown path testable by canceling a
+// context directly instead of delivering a real signal.
+func serve(ctx context.Context, cfg *appConfig) error {
 	// Wire the platform adapters. The capture adapter reads the desktop; the
 	// input adapter injects keyboard and pointer events. Both are selected by
 	// build tags behind the neutral capture and input packages, so this wiring
@@ -520,6 +529,16 @@ func run(cfg *appConfig) error {
 		return fmt.Errorf("host: listen: %w", err)
 	}
 	defer ln.Close()
+
+	// Cancellation must unblock the Accept below: ctx alone does not close the
+	// listener, so register a callback that does. stopClose unregisters the
+	// callback if it has not started; if cancellation already started it, that
+	// callback may still call Close concurrently with the deferred Close.
+	// Listener methods support concurrent calls, and any redundant-Close error
+	// is ignored by both call sites.
+	stopClose := context.AfterFunc(ctx, func() { _ = ln.Close() })
+	defer stopClose()
+
 	fmt.Printf("vdhost listening on %s\n", ln.Addr())
 	if cfg.ephemeralCert {
 		// Publish the pin a client must use with -fingerprint (F6 / AC-7).
