@@ -92,7 +92,7 @@ The state machine is:
 5. `Closing`: a peer sends `CLOSE`, stops new application messages, flushes at most one bounded write, and closes TLS/TCP.
 6. `Closed`: capture, encoder, reader, writer, and input workers are canceled and joined.
 
-Messages invalid for the current state are protocol errors. One read loop and one write loop own the connection; other goroutines communicate through bounded typed queues. Any fatal read, write, authentication, capture, injection, or context error cancels the whole session. Idle sessions exchange `PING`/`PONG`; no valid message for 30 seconds causes a ping, and no response within 30 seconds closes the session. (Both values default to 30 s via `--heartbeat-interval` / `--heartbeat-timeout`; see `cmd/vdhost/main.go`.) Exact timeout values are configuration with these defaults and bounded minimums.
+Messages invalid for the current state are protocol errors. One read loop and one write loop own the connection; other goroutines communicate through bounded channels. Any fatal read, write, authentication, capture, injection, or context error cancels the whole session. Idle sessions exchange `PING`/`PONG`. Both sides send an unsolicited `PING` probe after roughly `HeartbeatInterval/2` of idle (15 s at the 30 s default); a peer with no `PONG` within `HeartbeatTimeout` (30 s default) after a `PING` is treated as gone and the session closes. The read deadline has two regimes: the establishment `IOTimeout` (10 s default) before the session is `Active`, and `HeartbeatInterval + HeartbeatTimeout + 5 s` slack once `Active` (`internal/transport/peer.go` `SetSteadyReadTimeout`). Both defaults are configurable via `--heartbeat-interval` / `--heartbeat-timeout` (see `cmd/vdhost/main.go`); startup rejects non-positive values and `HeartbeatInterval > HeartbeatTimeout + 5 s`.
 
 The client bounds the entire initial connect sequence — dial, TLS handshake, authentication, and `CLIENT_HELLO`/`SERVER_HELLO` negotiation — with a configurable `--connect-timeout` (default `0` = no limit; see `cmd/vdclient/main.go`). When the deadline is exhausted the client stops reconnecting instead of looping against a dead host.
 
@@ -155,7 +155,7 @@ The host tracks pressed usages per session, suppresses duplicate `UP`, bounds th
 
 `POINTER_WHEEL` carries signed 16-bit horizontal and vertical wheel deltas in multiples of 120 units per detent. Trackpads may accumulate fractional local movement until a non-zero wire delta is available. Values are range-checked and rate-limited before injection.
 
-Input uses a bounded client send queue. Pointer moves may be replaced by a newer move. Key, button, and wheel transitions are never silently dropped; if their queue is full or a write deadline expires, the client closes the session so host cleanup releases state.
+Input is delivered over the peer's write path, bounded by the write deadline. Pointer moves may be replaced by a newer move. Key, button, and wheel transitions are never silently dropped; if a write deadline expires (the host is not keeping up), the client closes the session so host cleanup releases state.
 
 ## 8. Protocol direction matrix
 
@@ -179,7 +179,7 @@ Suggested module layout:
 - `internal/cliconfig`: shared Viper wiring used by both commands, giving every configuration value flag > environment variable (`VDHOST_*`/`VDCLIENT_*`) > YAML config file > default precedence. See the top-level README for the full precedence rules and example config files.
 - `internal/protocol`: constants, typed messages, framing, version negotiation, limits, direction/state validation; no OS or UI imports.
 - `internal/transport`: TLS configuration, dialing/listening, deadlines, connection read/write ownership, authentication.
-- `internal/session`: lifecycle state machine, cancellation, heartbeats, queues, host/client orchestration.
+- `internal/session`: lifecycle state machine, cancellation, heartbeats, host/client orchestration.
 - `internal/frame`: framebuffer model, rectangles, BGRA validation, zlib codec, delta application.
 - `internal/damage`: tile comparison, dirty-region coalescing, keyframe policy; pure and deterministic.
 - `internal/host/capture`: platform-neutral capture interface and immutable frame result.

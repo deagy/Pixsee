@@ -19,20 +19,28 @@ var (
 	ErrClosed         = errors.New("transport closed")
 )
 
+// HeartbeatSlack is the grace window added to HeartbeatInterval +
+// HeartbeatTimeout when deriving the steady-state (Active) read deadline.
+// Establishment reads keep the peer's IOTimeout; once a session is Active the
+// heartbeat watchdog owns dead-peer detection, and this slack keeps a healthy
+// idle peer's read from expiring before the watchdog can act.
+const HeartbeatSlack = 5 * time.Second
+
 type Peer struct {
-	conn            net.Conn
-	rawConn         net.Conn
-	role            protocol.Role
-	encoder         *protocol.Encoder
-	decoder         *protocol.Decoder
-	timeout         time.Duration
-	sendMu          sync.Mutex
-	receiveMu       sync.Mutex
-	stateMu         sync.Mutex
-	state           protocol.State
-	clientHelloSeen bool
-	serverHelloSeen bool
-	close           sync.Once
+	conn              net.Conn
+	rawConn           net.Conn
+	role              protocol.Role
+	encoder           *protocol.Encoder
+	decoder           *protocol.Decoder
+	timeout           time.Duration
+	steadyReadTimeout time.Duration // guarded by stateMu; 0 disables the switch
+	sendMu            sync.Mutex
+	receiveMu         sync.Mutex
+	stateMu           sync.Mutex
+	state             protocol.State
+	clientHelloSeen   bool
+	serverHelloSeen   bool
+	close             sync.Once
 }
 
 func NewPeer(conn net.Conn, role protocol.Role, limits protocol.Limits, timeout time.Duration) *Peer {
@@ -64,6 +72,30 @@ func (p *Peer) State() protocol.State {
 	p.stateMu.Lock()
 	defer p.stateMu.Unlock()
 	return p.state
+}
+
+// SetSteadyReadTimeout arms the heartbeat-derived read deadline that Receive
+// switches to once the session reaches the Active state. Reads before Active
+// (TLS handshake, AUTH, HELLO, the first DISPLAY_CONFIG) keep the peer's
+// establishment timeout. A non-positive d disables the switch.
+func (p *Peer) SetSteadyReadTimeout(d time.Duration) {
+	if p == nil {
+		return
+	}
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	p.steadyReadTimeout = d
+}
+
+// readTimeout picks the regime for the next read: the steady-state deadline
+// once the session is Active, otherwise the establishment IOTimeout.
+func (p *Peer) readTimeout() time.Duration {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	if p.steadyReadTimeout > 0 && p.state == protocol.StateActive {
+		return p.steadyReadTimeout
+	}
+	return p.timeout
 }
 
 func (p *Peer) Send(ctx context.Context, message protocol.Message) error {
@@ -237,7 +269,7 @@ func (p *Peer) Close() error {
 }
 
 func (p *Peer) withReadDeadline(ctx context.Context, operation func() error) error {
-	deadline, stop, err := operationDeadline(ctx, p.timeout, p.conn.SetReadDeadline)
+	deadline, stop, err := operationDeadline(ctx, p.readTimeout(), p.conn.SetReadDeadline)
 	if err != nil {
 		return err
 	}

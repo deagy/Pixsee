@@ -9,7 +9,6 @@ import (
 
 	"virtualdesktop/internal/host"
 	"virtualdesktop/internal/protocol"
-	"virtualdesktop/internal/transport"
 )
 
 // startHostWithLimit starts a real host service with a specific
@@ -25,31 +24,14 @@ func startHostWithLimit(t *testing.T, ctx context.Context, serverTLS *tls.Config
 		if err != nil {
 			return
 		}
-		svc := host.NewService(host.Config{
+		// AC-9: shared establishment path (internal/session.Accept) even for
+		// the throttling harness.
+		hostServiceWithConfig(ctx, conn, serverTLS, token, cap, input, &messageLog{}, host.Config{
 			CaptureInterval:         time.Millisecond,
 			KeyframeInterval:        time.Hour,
 			MaxInputEventsPerSecond: maxInput,
 			EnableInput:             true,
-		}, cap, input)
-		serverConn := tls.Server(conn, serverTLS.Clone())
-		if err := transport.Handshake(ctx, serverConn, 5*time.Second); err != nil {
-			return
-		}
-		peer := transport.NewPeerConn(serverConn, conn, protocol.RoleHost, protocol.DefaultLimits(), 5*time.Second)
-		if err := peer.AuthenticateHost(ctx, token); err != nil {
-			return
-		}
-		if _, err := peer.Receive(ctx); err != nil {
-			return
-		}
-		if err := peer.Send(ctx, protocol.ServerHello{Version: protocol.Version1}); err != nil {
-			return
-		}
-		runCtx, cancel := context.WithCancel(ctx)
-		go func() {
-			defer cancel()
-			_ = svc.Run(runCtx, peer)
-		}()
+		})
 	}()
 	return ln.Addr().String(), func() { ln.Close() }
 }

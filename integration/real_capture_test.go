@@ -17,6 +17,7 @@ import (
 	"virtualdesktop/internal/damage"
 	"virtualdesktop/internal/host"
 	"virtualdesktop/internal/protocol"
+	"virtualdesktop/internal/session"
 	"virtualdesktop/internal/transport"
 
 	capture_x11 "virtualdesktop/internal/host/capture"
@@ -170,26 +171,21 @@ func TestRealEndToEnd(t *testing.T) {
 			MaxInputEventsPerSecond: 1000,
 			EnableInput:             true,
 		}, realCap, hostInput)
-		serverConn := tls.Server(conn, serverTLS.Clone())
-		if err := transport.Handshake(ctx, serverConn, 5*time.Second); err != nil {
-			_ = conn.Close()
+		// AC-9: the real X11 host also uses the shipped establishment path.
+		established, err := session.Accept(ctx, conn, session.Config{
+			Token:     token,
+			TLSConfig: serverTLS,
+			Limits:    protocol.DefaultLimits(),
+			IOTimeout: 5 * time.Second,
+		})
+		if err != nil {
 			return
 		}
-		peer := transport.NewPeerConn(serverConn, conn, protocol.RoleHost, protocol.DefaultLimits(), 5*time.Second)
-		if err := peer.AuthenticateHost(ctx, token); err != nil {
-			_ = conn.Close()
-			return
-		}
-		if _, err := peer.Receive(ctx); err != nil {
-			_ = conn.Close()
-			return
-		}
-		_ = peer.Send(ctx, protocol.ServerHello{Version: protocol.Version1})
+		defer established.Release()
+		defer func() { _ = established.Peer.Close() }()
 		runCtx, cancel := context.WithCancel(ctx)
-		go func() {
-			defer cancel()
-			_ = svc.Run(runCtx, peer)
-		}()
+		defer cancel()
+		_ = svc.Run(runCtx, established.Peer)
 	}()
 
 	obs := &stateRecorder{}

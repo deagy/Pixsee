@@ -37,6 +37,16 @@ type Config struct {
 	Limits         protocol.Limits
 	IOTimeout      time.Duration
 	ReconnectDelay time.Duration
+	// HeartbeatInterval and HeartbeatTimeout mirror the host's
+	// -heartbeat-interval/-heartbeat-timeout flags (both default to 30s when
+	// unset, the same as the host's). In the steady state the read deadline is
+	// derived from them — interval + timeout + transport.HeartbeatSlack — the
+	// client probes an idle peer with an unsolicited PING after
+	// HeartbeatInterval/2 of receiving nothing, and a peer still silent
+	// HeartbeatTimeout after that probe closes the connection so the Run loop
+	// reconnects. Keep host and client symmetric; see docs §5.
+	HeartbeatInterval time.Duration
+	HeartbeatTimeout  time.Duration
 	// ConnectTimeout bounds the initial connect sequence (Dial + TLS
 	// handshake + AUTH + CLIENT_HELLO + SERVER_HELLO). On exhaustion Run
 	// returns an error instead of reconnecting forever against a black-hole
@@ -74,6 +84,12 @@ func NewSession(config Config, renderer Renderer, observer StateObserver) (*Sess
 	}
 	if config.ReconnectDelay <= 0 {
 		config.ReconnectDelay = time.Second
+	}
+	if config.HeartbeatInterval <= 0 {
+		config.HeartbeatInterval = 30 * time.Second
+	}
+	if config.HeartbeatTimeout <= 0 {
+		config.HeartbeatTimeout = 30 * time.Second
 	}
 	if config.Limits == (protocol.Limits{}) {
 		config.Limits = protocol.DefaultLimits()
@@ -179,7 +195,17 @@ func (s *Session) ServeConn(ctx context.Context, conn net.Conn) (result error) {
 	// Pass the raw socket so Close can bypass tls.Conn.Close's close_notify,
 	// which would hang when the remote peer has stopped reading.
 	peer := transport.NewPeerConn(tlsConn, conn, protocol.RoleClient, s.config.Limits, s.config.IOTimeout)
+	// D7: once the session is Active the read deadline derives from the
+	// heartbeat config, so the keepalive watchdog — not a per-operation I/O
+	// deadline — owns dead-peer detection. Establishment reads keep IOTimeout
+	// until the peer's state machine reaches Active.
+	peer.SetSteadyReadTimeout(s.config.HeartbeatInterval + s.config.HeartbeatTimeout + transport.HeartbeatSlack)
 	s.sender.set(peer)
+	// F1: a reconnect lands on a fresh host service whose generation restarts
+	// at 1. Drop the previous session's framebuffer state before this
+	// connection's first DISPLAY_CONFIG arrives, or it would be rejected as a
+	// stale display generation forever.
+	s.framebuffer.Reset()
 	defer func() {
 		s.sender.set(nil)
 		_ = s.input.Disconnect()
@@ -216,13 +242,28 @@ func (s *Session) ServeConn(ctx context.Context, conn net.Conn) (result error) {
 	if err := s.applyDisplay(config); err != nil {
 		return err
 	}
+	// F3: teardown disconnected input for the previous connection. Re-arm the
+	// input state per connection — before this point the generation is set
+	// and the sender is live, and input is connected=false until Connect, so
+	// no keystroke can reach the wire during establishment. Connect clears
+	// any inherited key/button bookkeeping (docs §5: no inherited input
+	// state on a new connection).
+	s.input.Connect()
 	s.notify(StateConnected, nil)
+
+	// Client-side keepalive (D7): probe an idle peer with PING and let the
+	// watchdog close a peer that stays silent past HeartbeatTimeout.
+	live := &keepalive{lastRx: time.Now()}
+	keepaliveCtx, stopKeepalive := context.WithCancel(ctx)
+	defer stopKeepalive()
+	go s.keepaliveLoop(keepaliveCtx, peer, live)
 
 	for {
 		message, err = peer.Receive(ctx)
 		if err != nil {
 			return err
 		}
+		live.touch()
 		switch value := message.(type) {
 		case protocol.DisplayConfig:
 			if err := s.applyDisplay(value); err != nil {
@@ -255,6 +296,63 @@ func (s *Session) ServeConn(ctx context.Context, conn net.Conn) (result error) {
 			return nil
 		default:
 			return fmt.Errorf("client: unexpected server message %T", message)
+		}
+	}
+}
+
+// keepalive tracks peer liveness for an established session (D7). The
+// receive loop touches it on every message; the keepaliveLoop probes a peer
+// that has sent nothing for HeartbeatInterval/2 with an unsolicited PING and
+// closes the connection once that peer stays silent for HeartbeatTimeout past
+// the probe, letting the Run loop reconnect. It mirrors the host's heartbeat
+// watchdog, which treats any received message as proof of life.
+type keepalive struct {
+	mu          sync.Mutex
+	lastRx      time.Time
+	outstanding bool
+}
+
+func (k *keepalive) touch() {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.lastRx = time.Now()
+	k.outstanding = false
+}
+
+func (s *Session) keepaliveLoop(ctx context.Context, peer *transport.Peer, live *keepalive) {
+	half := s.config.HeartbeatInterval / 2
+	if half <= 0 {
+		half = s.config.HeartbeatInterval
+	}
+	ticker := time.NewTicker(half)
+	defer ticker.Stop()
+	var nonce uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			live.mu.Lock()
+			idle := time.Since(live.lastRx)
+			if idle >= s.config.HeartbeatTimeout && live.outstanding {
+				live.mu.Unlock()
+				// Watchdog: a probe went out and no PONG (or any other
+				// message) came back within HeartbeatTimeout. Close so the
+				// session reconnects instead of drifting on a dead peer.
+				_ = peer.Close()
+				return
+			}
+			if idle >= half {
+				nonce++
+				live.outstanding = true
+				live.mu.Unlock()
+				if err := peer.Send(ctx, protocol.Ping{Nonce: nonce}); err != nil {
+					_ = peer.Close()
+					return
+				}
+				continue
+			}
+			live.mu.Unlock()
 		}
 	}
 }

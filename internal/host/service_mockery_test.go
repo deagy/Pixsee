@@ -32,6 +32,7 @@ func TestServiceRunHappyPathSendsDisplayAndFrame(t *testing.T) {
 	capture := mocks.NewMockCapture(t)
 	input := mocks.NewMockInput(t)
 	peer := mocks.NewMockPeer(t)
+	peer.EXPECT().SetSteadyReadTimeout(mock.Anything).Maybe()
 
 	image := damage.Image{Width: 2, Height: 2, Pixels: make([]byte, 2*2*4)}
 	capture.EXPECT().Capture(mock.Anything, uint32(0)).Return(image, nil).Once()
@@ -63,6 +64,7 @@ func TestServiceRunCaptureErrorPropagates(t *testing.T) {
 	capture := mocks.NewMockCapture(t)
 	input := mocks.NewMockInput(t)
 	peer := mocks.NewMockPeer(t)
+	peer.EXPECT().SetSteadyReadTimeout(mock.Anything).Maybe()
 
 	boom := errors.New("capture boom")
 	capture.EXPECT().Capture(mock.Anything, uint32(0)).Return(damage.Image{}, boom).Once()
@@ -82,6 +84,7 @@ func TestServiceRunSendErrorPropagates(t *testing.T) {
 	capture := mocks.NewMockCapture(t)
 	input := mocks.NewMockInput(t)
 	peer := mocks.NewMockPeer(t)
+	peer.EXPECT().SetSteadyReadTimeout(mock.Anything).Maybe()
 
 	image := damage.Image{Width: 2, Height: 2, Pixels: make([]byte, 2*2*4)}
 	boom := errors.New("send boom")
@@ -102,6 +105,7 @@ func TestServiceRunRejectsInvalidInputMessage(t *testing.T) {
 	capture := mocks.NewMockCapture(t)
 	input := mocks.NewMockInput(t)
 	peer := mocks.NewMockPeer(t)
+	peer.EXPECT().SetSteadyReadTimeout(mock.Anything).Maybe()
 
 	image := damage.Image{Width: 2, Height: 2, Pixels: make([]byte, 2*2*4)}
 	capture.EXPECT().Capture(mock.Anything, uint32(0)).Return(image, nil).Once()
@@ -127,6 +131,7 @@ func TestServiceRunInjectsKeyInput(t *testing.T) {
 	capture := mocks.NewMockCapture(t)
 	input := mocks.NewMockInput(t)
 	peer := mocks.NewMockPeer(t)
+	peer.EXPECT().SetSteadyReadTimeout(mock.Anything).Maybe()
 
 	image := damage.Image{Width: 2, Height: 2, Pixels: make([]byte, 2*2*4)}
 	capture.EXPECT().Capture(mock.Anything, uint32(0)).Return(image, nil).Once()
@@ -165,6 +170,7 @@ func TestServiceRunRequiresDependencies(t *testing.T) {
 	capture := mocks.NewMockCapture(t)
 	input := mocks.NewMockInput(t)
 	peer := mocks.NewMockPeer(t)
+	peer.EXPECT().SetSteadyReadTimeout(mock.Anything).Maybe()
 
 	svc := NewService(mockTestConfig(), capture, input)
 	err := svc.Run(context.Background(), nil)

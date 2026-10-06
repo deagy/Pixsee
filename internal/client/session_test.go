@@ -109,7 +109,9 @@ func TestSessionAuthenticatesRendersResizeAndForwardsInput(t *testing.T) {
 func TestRunReturnsOnCleanServerClose(t *testing.T) {
 	serverTLS, clientTLS := sessionTLSConfigs(t)
 	serverRaw, clientRaw := net.Pipe()
+	srvDone := make(chan struct{})
 	go func() {
+		defer close(srvDone)
 		serverConn := tls.Server(serverRaw, serverTLS)
 		if err := transport.Handshake(context.Background(), serverConn, 2*time.Second); err != nil {
 			t.Logf("server handshake: %v", err)
@@ -165,6 +167,14 @@ func TestRunReturnsOnCleanServerClose(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("ServeConn did not return after clean server CLOSE")
+	}
+	// The server goroutine logs to t; wait for it to finish before returning,
+	// otherwise its trailing t.Logf races with the test framework's teardown
+	// bookkeeping once this function exits (surfaced by the -race gate).
+	select {
+	case <-srvDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server goroutine did not finish")
 	}
 }
 

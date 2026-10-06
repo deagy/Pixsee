@@ -4,17 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
 	"virtualdesktop/internal/damage"
 	"virtualdesktop/internal/protocol"
+	"virtualdesktop/internal/transport"
 )
 
 var (
-	ErrInvalidInput     = errors.New("invalid host input")
-	ErrInputDisabled    = fmt.Errorf("%w: input is disabled", ErrInvalidInput)
-	ErrInputRate        = fmt.Errorf("%w: rate limit exceeded", ErrInvalidInput)
+	ErrInvalidInput  = errors.New("invalid host input")
+	ErrInputDisabled = fmt.Errorf("%w: input is disabled", ErrInvalidInput)
+	// ErrHeartbeatTimeout is reported when the watchdog reaps a silent peer.
 	ErrHeartbeatTimeout = errors.New("no response to heartbeat")
 )
 
@@ -33,19 +35,32 @@ type Input interface {
 type Peer interface {
 	Send(context.Context, protocol.Message) error
 	Receive(context.Context) (protocol.Message, error)
+	// SetSteadyReadTimeout arms the heartbeat-derived read deadline that the
+	// implementation applies once the session reaches Active (spec D7). It is
+	// part of the contract so a future wrapper cannot silently regress F2 by
+	// dropping the method; host.Service.Run keeps a runtime assertion as
+	// defence in depth.
+	SetSteadyReadTimeout(time.Duration)
 }
 
 type Config struct {
-	DisplayID               uint32
-	CaptureInterval         time.Duration
-	KeyframeInterval        time.Duration
+	DisplayID        uint32
+	CaptureInterval  time.Duration
+	KeyframeInterval time.Duration
+	// MaxInputEventsPerSecond is the input rate limit. Exceeding it sheds
+	// events (counted via Service.InputDropped, one log line per burst)
+	// rather than terminating the session (F7/Q5).
 	MaxInputEventsPerSecond int
 	EnableInput             bool
 	Damage                  damage.Config
-	// HeartbeatInterval is how long the idle host waits before sending a
-	// PING probe to a connected client; HeartbeatTimeout is how long the host
-	// waits for a PONG (or any message) after the last activity before it
-	// treats the session as gone. Both default to 30s when zero.
+	// HeartbeatInterval is the heartbeat cadence: an unsolicited PING probe
+	// goes out to the client once half this interval has passed without any
+	// message from it (spec D7: both sides probe at HeartbeatInterval/2 of
+	// idle). HeartbeatTimeout is how long a fully silent peer survives before
+	// the watchdog treats the session as gone. Both default to 30s when zero.
+	// In the steady state the read deadline is interval + timeout +
+	// transport.HeartbeatSlack, so the watchdog — never a short per-operation
+	// I/O deadline — owns dead-peer detection.
 	HeartbeatInterval time.Duration
 	HeartbeatTimeout  time.Duration
 }
@@ -61,6 +76,13 @@ type Service struct {
 	lastInputSeq    uint64
 	rateWindowStart time.Time
 	rateCount       int
+	// rateDrops counts input events shed by the rate limiter (Q5: overrun
+	// degrades with a counted, logged signal instead of terminating the
+	// session — finding F7). Guarded by mu like the rest of the rate state.
+	rateDrops int64
+	// rateBurstActive marks an ongoing drop burst so exactly one log line is
+	// emitted per burst, never per event.
+	rateBurstActive bool
 	// keyframeRequested is set when the client sends a KEYFRAME_REQUEST (it
 	// received a delta it could not apply) and cleared the next time the send
 	// loop processes a capture, forcing that capture to be a full keyframe so
@@ -69,8 +91,16 @@ type Service struct {
 	// pingNonce is a monotonic heartbeat nonce so each PING is distinguishable.
 	pingNonce uint64
 	// lastActivity is the last time any message arrived from the client; the
-	// heartbeat loop uses it to decide when to probe and when to give up.
+	// heartbeat loop uses it to decide when to probe.
 	lastActivity time.Time
+	// pendingPing marks an unanswered probe: sentAt is when the last PING went
+	// out and any message from the client clears it. The give-up branch fires
+	// only past a probe (D7: "no PONG within HeartbeatTimeout after a PING"),
+	// never on a session whose probes are being answered — the elapsed-since-
+	// activity formulation put the deadline exactly on the tick phase and let
+	// scheduling jitter kill healthy sessions.
+	pendingPing     bool
+	pendingPingSent time.Time
 }
 
 func NewService(config Config, capture Capture, input Input) *Service {
@@ -98,10 +128,31 @@ func NewService(config Config, capture Capture, input Input) *Service {
 	return &Service{config: config, capture: capture, input: input}
 }
 
+// InputDropped reports how many input events the rate limiter has shed since
+// the service started (Q5 telemetry for F7: overruns drop + count + one log
+// line per burst; the session survives).
+func (s *Service) InputDropped() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rateDrops
+}
+
 func (s *Service) Run(ctx context.Context, peer Peer) error {
 	if ctx == nil || peer == nil || s.capture == nil || s.input == nil {
 		return errors.New("host service requires context, peer, capture, and input adapters")
 	}
+	// D7: in the steady state (Active) the read deadline derives from the
+	// heartbeat config so the heartbeat watchdog — not a short per-operation
+	// I/O deadline — owns dead-peer detection. Establishment reads keep the
+	// peer's IOTimeout until the first DISPLAY_CONFIG flips the session to
+	// Active. SetSteadyReadTimeout is part of the Peer contract (O2), so the
+	// type assertion below is a runtime belt for dynamically-wrapped peers;
+	// it refuses the session rather than silently skipping the arming (N1).
+	setter, ok := peer.(interface{ SetSteadyReadTimeout(time.Duration) })
+	if !ok {
+		return fmt.Errorf("host service: peer %T does not implement SetSteadyReadTimeout; steady-state read deadlines must derive from the heartbeat config (F2/D7)", peer)
+	}
+	setter.SetSteadyReadTimeout(s.config.HeartbeatInterval + s.config.HeartbeatTimeout + transport.HeartbeatSlack)
 	image, err := s.capture.Capture(ctx, s.config.DisplayID)
 	if err != nil {
 		return fmt.Errorf("capture initial display: %w", err)
@@ -112,7 +163,7 @@ func (s *Service) Run(ctx context.Context, peer Peer) error {
 		return err
 	}
 	// Seed the heartbeat's activity clock so the first probe fires only after
-	// a full HeartbeatInterval of idle, not immediately on the zero time.
+	// half a HeartbeatInterval of idle, not immediately on the zero time.
 	s.recordActivity()
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -239,19 +290,30 @@ func (s *Service) inputLoop(ctx context.Context, peer Peer, errs chan<- error) {
 }
 
 // recordActivity stamps the last time any message arrived so the heartbeat
-// loop can tell a responsive peer from a silent one.
+// loop can tell a responsive peer from a silent one. Any message also answers
+// a pending PING probe (the watchdog only counts silence past a probe).
 func (s *Service) recordActivity() {
 	s.mu.Lock()
 	s.lastActivity = time.Now()
+	s.pendingPing = false
 	s.mu.Unlock()
 }
 
 // heartbeatLoop implements the idle-session watchdog described in
-// docs/architecture.md: after HeartbeatInterval of inactivity the host probes
-// the client with a PING; if no message (PING, PONG, or otherwise) arrives
-// within HeartbeatTimeout the session is treated as gone.
+// docs/architecture.md per remediation spec D7: once the peer has sent nothing
+// for half the heartbeat interval the host probes it with an unsolicited PING
+// (both sides probe at HeartbeatInterval/2 of idle), and a peer that stays
+// silent for a full HeartbeatTimeout after an unanswered probe is treated as
+// gone. Give-up is measured past the probe — not past the last activity on a
+// phase-aligned tick — so a peer whose PONGs keep arriving can never be
+// reaped by scheduling jitter, and the heartbeat watchdog (not the read
+// deadline) owns dead-peer detection.
 func (s *Service) heartbeatLoop(ctx context.Context, peer Peer, errs chan<- error) {
-	ticker := time.NewTicker(s.config.HeartbeatInterval)
+	half := s.config.HeartbeatInterval / 2
+	if half <= 0 {
+		half = s.config.HeartbeatInterval
+	}
+	ticker := time.NewTicker(half)
 	defer ticker.Stop()
 	for {
 		select {
@@ -259,21 +321,28 @@ func (s *Service) heartbeatLoop(ctx context.Context, peer Peer, errs chan<- erro
 			return
 		case <-ticker.C:
 			s.mu.Lock()
-			elapsed := time.Since(s.lastActivity)
-			s.mu.Unlock()
-			if elapsed >= s.config.HeartbeatTimeout {
+			if s.pendingPing && time.Since(s.pendingPingSent) >= s.config.HeartbeatTimeout {
+				s.mu.Unlock()
 				report(errs, ErrHeartbeatTimeout)
 				return
 			}
-			if elapsed >= s.config.HeartbeatInterval {
-				s.mu.Lock()
+			probe := time.Since(s.lastActivity) >= half
+			var nonce uint64
+			if probe {
 				s.pingNonce++
-				nonce := s.pingNonce
-				s.mu.Unlock()
-				if err := peer.Send(ctx, protocol.Ping{Nonce: nonce}); err != nil {
-					report(errs, err)
-					return
+				nonce = s.pingNonce
+				if !s.pendingPing {
+					s.pendingPing = true
+					s.pendingPingSent = time.Now()
 				}
+			}
+			s.mu.Unlock()
+			if !probe {
+				continue
+			}
+			if err := peer.Send(ctx, protocol.Ping{Nonce: nonce}); err != nil {
+				report(errs, err)
+				return
 			}
 		}
 	}
@@ -328,9 +397,23 @@ func (s *Service) handleInput(ctx context.Context, peer Peer, message protocol.M
 		s.rateWindowStart, s.rateCount = now, 0
 	}
 	if s.rateCount >= s.config.MaxInputEventsPerSecond {
+		// Q5 (F7): a rate overrun is a DEGRADE, not a disconnect — a fast
+		// polling mouse legitimately exceeds the limit. Drop the event,
+		// count it, and log exactly one line at the start of each burst.
+		// Session termination stays reserved for protocol violations, which
+		// the checks above still enforce.
+		s.rateDrops++
+		firstOfBurst := !s.rateBurstActive
+		s.rateBurstActive = true
+		total := s.rateDrops
 		s.mu.Unlock()
-		return ErrInputRate
+		if firstOfBurst {
+			slog.Info("host: input rate limit exceeded, dropping events until the next rate window",
+				"limit_per_second", s.config.MaxInputEventsPerSecond, "total_dropped", total)
+		}
+		return nil
 	}
+	s.rateBurstActive = false // an accepted event ends any drop burst
 	width, height := s.width, s.height
 	s.rateCount++
 	s.lastInputSeq = sequence
