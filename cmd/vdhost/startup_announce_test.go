@@ -28,7 +28,10 @@ var (
 	vdhostBuildOK   bool
 )
 
-// buildVdhost compiles the real cmd/vdhost binary once per test run.
+// buildVdhost compiles the real cmd/vdhost binary once per test run. Call it
+// before sanitizeVdhostEnv: changing HOME to a t.TempDir can redirect a cold
+// Go module cache beneath that directory, where TempDir cleanup cannot remove
+// the read-only module-cache entries.
 func buildVdhost(t *testing.T) string {
 	t.Helper()
 	vdhostBuildOnce.Do(func() {
@@ -122,6 +125,7 @@ func runVdhostToExit(t *testing.T, timeout time.Duration, args ...string) (error
 // and the error must name the address. At 3983c4b the host starts and
 // listens happily (F4: warning-only), so this is red.
 func TestVdhostRefusesNonLoopbackBindWithoutToken(t *testing.T) {
+	buildVdhost(t)
 	sanitizeVdhostEnv(t)
 	exitErr, output, exited := runVdhostToExit(t, 5*time.Second, "-addr", "0.0.0.0:0")
 	if !exited {
@@ -152,8 +156,8 @@ var fingerprintLineRE = regexp.MustCompile(`(?i)ephemeral certificate sha-256 fi
 // published) — today the child even dies on the unknown -no-auth flag, which
 // is itself part of the same missing feature set. Both are runtime-red.
 func TestVdhostAnnouncesEphemeralCertFingerprint(t *testing.T) {
-	sanitizeVdhostEnv(t)
 	bin := buildVdhost(t)
+	sanitizeVdhostEnv(t)
 	cmd := exec.Command(bin, "-addr", "127.0.0.1:0", "-no-auth")
 	cmd.Dir = t.TempDir()
 	cmd.Env = childEnv(t)
