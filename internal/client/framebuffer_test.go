@@ -37,6 +37,52 @@ func TestFramebufferComposesRegionsAndResizeRequiresKeyframe(t *testing.T) {
 	}
 }
 
+// TestFramebufferRejectsStaleKeyframeSequence proves a same-generation keyframe
+// whose FrameSequence does not advance past the last committed sequence is a
+// duplicate or replayed frame: it is rejected without mutating the committed
+// pixels or sequence, and a valid higher keyframe — the host's periodic refresh
+// — still commits.
+func TestFramebufferRejectsStaleKeyframeSequence(t *testing.T) {
+	fb := configuredFramebuffer(t, protocol.DefaultLimits())
+	first := protocol.Frame{Generation: 1, FrameSequence: 1, Keyframe: true, Rectangles: keyframeRects4x2()}
+	if err := fb.Apply(first); err != nil {
+		t.Fatal(err)
+	}
+	// Host cadence: a delta, then a periodic keyframe for the refresh. Both
+	// advance the sequence and must remain accepted.
+	delta := protocol.Frame{Generation: 1, FrameSequence: 2, BaseFrameSequence: 1, Rectangles: []protocol.Rectangle{rawRect(0, 0, 1, 1, 50)}}
+	if err := fb.Apply(delta); err != nil {
+		t.Fatalf("valid delta rejected: %v", err)
+	}
+	periodic := protocol.Frame{Generation: 1, FrameSequence: 3, Keyframe: true, Rectangles: forcedRects4x2()}
+	if err := fb.Apply(periodic); err != nil {
+		t.Fatalf("periodic keyframe rejected: %v", err)
+	}
+	before := fb.Snapshot()
+
+	// Stale lower (1, 2) and the equal duplicate (3) must all be rejected
+	// without touching the committed frame.
+	for _, seq := range []uint64{1, 2, 3} {
+		stale := protocol.Frame{Generation: 1, FrameSequence: seq, Keyframe: true, Rectangles: keyframeRects4x2()}
+		if err := fb.Apply(stale); err == nil {
+			t.Fatalf("accepted a keyframe at sequence %d <= committed 3", seq)
+		}
+		if got := fb.Snapshot(); got.FrameSequence != before.FrameSequence || !bytes.Equal(got.Pixels, before.Pixels) {
+			t.Fatalf("rejecting stale keyframe %d mutated the committed frame", seq)
+		}
+	}
+
+	// The host's next periodic keyframe advances the sequence and commits.
+	next := protocol.Frame{Generation: 1, FrameSequence: 4, Keyframe: true, Rectangles: keyframeRects4x2()}
+	if err := fb.Apply(next); err != nil {
+		t.Fatalf("valid higher keyframe rejected: %v", err)
+	}
+	want := reference4x2(t, first, delta, periodic, next)
+	if got := fb.Snapshot(); got.FrameSequence != want.FrameSequence || !bytes.Equal(got.Pixels, want.Pixels) {
+		t.Fatal("valid higher keyframe did not commit")
+	}
+}
+
 func TestFramebufferDecodesZlibAndRejectsBadUpdatesAtomically(t *testing.T) {
 	limits := protocol.DefaultLimits()
 	fb := NewFramebuffer(limits)
@@ -88,6 +134,39 @@ func compressedPayload(t *testing.T, p []byte) []byte {
 		t.Fatal(err)
 	}
 	return b.Bytes()
+}
+
+// TestDecodeRectangleRawBGRAReusesValidatedPixels proves the raw path returns
+// the already-owned, length-validated rectangle slice (the row blit performs
+// the sole copy into staging) rather than allocating a second full copy. The
+// decoded bytes are byte-identical to the input and decoding allocates nothing.
+func TestDecodeRectangleRawBGRAReusesValidatedPixels(t *testing.T) {
+	rect := rawRect(0, 0, 3, 2, 7)
+	decoded, err := decodeRectangle(rect, protocol.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) != len(rect.Pixels) || !bytes.Equal(decoded, rect.Pixels) {
+		t.Fatal("raw decode did not return the rectangle's pixels")
+	}
+	if &decoded[0] != &rect.Pixels[0] {
+		t.Fatal("raw decode copied the validated pixel slice instead of reusing it")
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		_, _ = decodeRectangle(rect, protocol.DefaultLimits())
+	}); allocs != 0 {
+		t.Fatalf("raw decode allocated %.1f times, want 0", allocs)
+	}
+}
+
+func BenchmarkDecodeRectangleRawBGRA(b *testing.B) {
+	rect := rawRect(0, 0, 64, 64, 3)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := decodeRectangle(rect, protocol.DefaultLimits()); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 // FuzzDecodeRectangle feeds the zlib framebuffer decoder random bytes so the

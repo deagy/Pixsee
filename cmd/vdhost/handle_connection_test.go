@@ -62,6 +62,18 @@ func generateHandleConnCert(t *testing.T) tls.Certificate {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }
 
+// TestHostLimitsUseProtocolDefaults pins the single source of wire limits that
+// handleConnection hands to BOTH session.Accept and host.NewService. If a
+// future change raises or lowers the host's limits, this test forces the change
+// to be deliberate — the establishment session's decoder and the display
+// service's input validator / FRAME_PART packer must not silently drift onto
+// different caps (finding L3).
+func TestHostLimitsUseProtocolDefaults(t *testing.T) {
+	if got, want := hostLimits(), protocol.DefaultLimits(); got != want {
+		t.Fatalf("hostLimits()=%+v, want protocol.DefaultLimits()=%+v", got, want)
+	}
+}
+
 // TestHandleConnectionPerformsHelloNegotiationBeforeServiceLoop is a
 // regression test for the "no GUI + continuous error stream" bug: vdhost's
 // handleConnection MUST exchange CLIENT_HELLO/SERVER_HELLO before invoking

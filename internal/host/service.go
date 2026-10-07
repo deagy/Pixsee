@@ -63,6 +63,15 @@ type Config struct {
 	// I/O deadline — owns dead-peer detection.
 	HeartbeatInterval time.Duration
 	HeartbeatTimeout  time.Duration
+	// ProtocolVersion is the negotiated session protocol version. Zero (the
+	// default) preserves v1 behavior: an oversized v1 capture is downscaled so
+	// its single FRAME stays within the v1 raw-frame budget, and only ordinary
+	// FRAME messages are emitted. Version2 keeps native resolution and splits
+	// an oversized frame into ordered FRAME_PARTs.
+	ProtocolVersion uint16
+	// Limits bounds wire framing; zero selects protocol.DefaultLimits(). It is
+	// the active limit set SplitFrame uses to size FRAME_PARTs on v2.
+	Limits protocol.Limits
 }
 
 type Service struct {
@@ -70,12 +79,16 @@ type Service struct {
 	capture Capture
 	input   Input
 
-	mu              sync.RWMutex
-	generation      uint64
-	width, height   uint32
-	lastInputSeq    uint64
-	rateWindowStart time.Time
-	rateCount       int
+	mu            sync.RWMutex
+	generation    uint64
+	width, height uint32
+	// nativeWidth/nativeHeight are the captured (pre-downscale) dimensions. On
+	// a downscaled v1 session they are the target of the incoming pointer
+	// remap; on v2 and non-downscaled v1 they equal width/height.
+	nativeWidth, nativeHeight uint32
+	lastInputSeq              uint64
+	rateWindowStart           time.Time
+	rateCount                 int
 	// rateDrops counts input events shed by the rate limiter (Q5: overrun
 	// degrades with a counted, logged signal instead of terminating the
 	// session — finding F7). Guarded by mu like the rest of the rate state.
@@ -125,7 +138,52 @@ func NewService(config Config, capture Capture, input Input) *Service {
 	if config.HeartbeatTimeout <= 0 {
 		config.HeartbeatTimeout = 30 * time.Second
 	}
+	// Zero ProtocolVersion preserves v1 behavior for existing callers and
+	// tests; only an explicit Version2 opts into native-resolution FRAME_PARTs.
+	if config.ProtocolVersion != protocol.Version2 {
+		config.ProtocolVersion = protocol.Version1
+	}
+	if config.Limits == (protocol.Limits{}) {
+		config.Limits = protocol.DefaultLimits()
+	}
+	// Normalize once to the effective wire limits the codec, validator, and
+	// SplitFrame all apply (mirroring protocol.Limits.bounded, which is
+	// unexported): a zero or over-hard field falls back to the protocol hard
+	// cap. Storing the enforced values lets a feasibility error name the cap
+	// that is actually applied rather than a raw zero/oversized config field.
+	config.Limits = effectiveLimits(config.Limits)
+	// Clamp the detector's rectangle byte budget and rectangle count to the
+	// effective wire limits before any capture, so a reduced MaxPixelPayload or
+	// MaxRectangles cannot let the detector band a rectangle (or emit a
+	// rectangle count) the codec or SplitFrame then rejects.
+	config.Damage = damage.EffectiveConfig(config.Damage, config.Limits)
 	return &Service{config: config, capture: capture, input: input}
+}
+
+// effectiveLimits returns limits with every zero or over-hard field replaced by
+// the protocol hard cap, mirroring protocol.Limits.bounded exactly so the host
+// applies — and can report — the same effective caps the codec, validator, and
+// SplitFrame compute internally. This is the single place the host normalizes
+// its wire limits; downstream code passes the result straight through, so the
+// normalization is idempotent with protocol's own bounding.
+func effectiveLimits(limits protocol.Limits) protocol.Limits {
+	defaults := protocol.DefaultLimits()
+	if limits.MaxControlPayload == 0 || limits.MaxControlPayload > protocol.MaxControlPayloadHard {
+		limits.MaxControlPayload = defaults.MaxControlPayload
+	}
+	if limits.MaxPixelPayload == 0 || limits.MaxPixelPayload > protocol.MaxPixelPayloadHard {
+		limits.MaxPixelPayload = defaults.MaxPixelPayload
+	}
+	if limits.MaxRectangles == 0 || limits.MaxRectangles > protocol.MaxRectanglesHard {
+		limits.MaxRectangles = defaults.MaxRectangles
+	}
+	if limits.MaxFrameParts == 0 || limits.MaxFrameParts > protocol.MaxFramePartsHard {
+		limits.MaxFrameParts = defaults.MaxFrameParts
+	}
+	if limits.MaxDimension == 0 || limits.MaxDimension > protocol.MaxDimensionHard {
+		limits.MaxDimension = defaults.MaxDimension
+	}
+	return limits
 }
 
 // InputDropped reports how many input events the rate limiter has shed since
@@ -153,11 +211,17 @@ func (s *Service) Run(ctx context.Context, peer Peer) error {
 		return fmt.Errorf("host service: peer %T does not implement SetSteadyReadTimeout; steady-state read deadlines must derive from the heartbeat config (F2/D7)", peer)
 	}
 	setter.SetSteadyReadTimeout(s.config.HeartbeatInterval + s.config.HeartbeatTimeout + transport.HeartbeatSlack)
+	// Build the detector against the active wire limits first, so a pixel-payload
+	// budget too small for even a one-pixel frame is reported clearly before any
+	// capture is attempted rather than as a frame the codec rejects later.
+	detector, err := damage.NewDetectorWithLimits(s.config.Damage, s.config.Limits)
+	if err != nil {
+		return fmt.Errorf("host service: %w", err)
+	}
 	image, err := s.capture.Capture(ctx, s.config.DisplayID)
 	if err != nil {
 		return fmt.Errorf("capture initial display: %w", err)
 	}
-	detector := damage.NewDetector(s.config.Damage)
 	lastKeyframe := time.Time{}
 	if lastKeyframe, err = s.sendCapture(ctx, peer, detector, image, true, lastKeyframe); err != nil {
 		return err
@@ -244,12 +308,34 @@ func (s *Service) sendCapture(ctx context.Context, peer Peer, detector *damage.D
 	s.keyframeRequested = false
 	s.mu.Unlock()
 
+	// Apply the v1 compatibility transform before damage detection and
+	// DISPLAY_CONFIG, so the detector, the advertised dimensions, and every
+	// encoded rectangle all agree on the downscaled geometry. The native
+	// dimensions are retained for pointer remapping.
+	native := image
+	image = s.prepareCapture(image)
+	s.mu.Lock()
+	s.nativeWidth, s.nativeHeight = native.Width, native.Height
+	s.mu.Unlock()
+
 	frame, changed, err := detector.Compare(image, force)
 	if err != nil {
-		return lastKeyframe, fmt.Errorf("process capture: %w", err)
+		return lastKeyframe, fmt.Errorf("process capture within MaxRectangles=%d, MaxFrameParts=%d, MaxPixelPayload=%d: %w",
+			s.config.Limits.MaxRectangles, s.config.Limits.MaxFrameParts, s.config.Limits.MaxPixelPayload, err)
 	}
 	if !changed {
 		return lastKeyframe, nil
+	}
+
+	// Plan the wire packing BEFORE announcing any DISPLAY_CONFIG (finding M2):
+	// a frame the configured MaxFrameParts/MaxPixelPayload cannot carry must be
+	// refused here, so the peer is never told a session exists and then left
+	// without the frame that completes it. The plan is what gets sent below, so
+	// the packing (SplitFrame) runs exactly once, never duplicated.
+	plan, err := s.planFrame(frame)
+	if err != nil {
+		return lastKeyframe, fmt.Errorf("host service: generation %d frame cannot be sent within MaxFrameParts=%d, MaxRectangles=%d, MaxPixelPayload=%d (rectangles=%d): %w",
+			frame.Generation, s.config.Limits.MaxFrameParts, s.config.Limits.MaxRectangles, s.config.Limits.MaxPixelPayload, len(frame.Rectangles), err)
 	}
 
 	s.mu.RLock()
@@ -265,13 +351,81 @@ func (s *Service) sendCapture(ctx context.Context, peer Peer, detector *damage.D
 		s.lastInputSeq = 0
 		s.mu.Unlock()
 	}
-	if err := peer.Send(ctx, frame); err != nil {
-		return lastKeyframe, fmt.Errorf("send frame: %w", err)
+	if err := s.sendPlan(ctx, peer, plan); err != nil {
+		return lastKeyframe, err
 	}
 	if frame.Keyframe {
 		lastKeyframe = time.Now()
 	}
 	return lastKeyframe, nil
+}
+
+// prepareCapture applies the v1 compatibility transform: when a v1 session's
+// capture exceeds the v1 raw-frame budget it is box-downscaled before damage
+// detection and DISPLAY_CONFIG, so the client receives a smaller advertised
+// display it can actually render instead of a frame the wire rejects. The
+// budget is the detector's effective per-rectangle budget, already clamped to
+// the session's pixel-payload limit, so a reduced limit downscales further
+// instead of overflowing the wire. A v2 session keeps native resolution and
+// relies on FRAME_PART splitting instead.
+func (s *Service) prepareCapture(image damage.Image) damage.Image {
+	if s.config.ProtocolVersion == protocol.Version2 {
+		return image
+	}
+	k := downscaleFactor(image.Width, image.Height, s.config.Damage.MaxRectangleBytes)
+	if k == 0 {
+		return image
+	}
+	return downscaleImage(image, k)
+}
+
+// framePlan describes how one logical frame goes on the wire: whole is true
+// when it is sent as a single FRAME, otherwise parts holds its ordered
+// FRAME_PART sequence. Planning is separated from sending so the packer runs
+// before any DISPLAY_CONFIG announces the session (finding M2) and so the pack
+// computed once is the one sent, never re-packed.
+type framePlan struct {
+	whole bool
+	frame protocol.Frame
+	parts []protocol.FramePart
+}
+
+// planFrame computes how frame will be sent under the active limits without
+// touching the peer. v1 always yields a whole FRAME because its wire has no
+// part type. On v2 it runs protocol.SplitFrame: a frame that fits stays whole
+// (ErrFrameFits), an oversized one becomes an ordered part list, and a frame
+// the limits cannot carry (ErrFrameTooLarge, ErrPartTooLarge) is returned so
+// the caller can refuse before sending DISPLAY_CONFIG.
+func (s *Service) planFrame(frame protocol.Frame) (framePlan, error) {
+	if s.config.ProtocolVersion != protocol.Version2 {
+		return framePlan{whole: true, frame: frame}, nil
+	}
+	parts, err := protocol.SplitFrame(frame, s.config.Limits)
+	switch {
+	case errors.Is(err, protocol.ErrFrameFits):
+		return framePlan{whole: true, frame: frame}, nil
+	case err != nil:
+		return framePlan{}, err
+	default:
+		return framePlan{parts: parts}, nil
+	}
+}
+
+// sendPlan transmits a plan computed by planFrame. A part send failure names
+// the part so a partially delivered logical frame is diagnosable.
+func (s *Service) sendPlan(ctx context.Context, peer Peer, plan framePlan) error {
+	if plan.whole {
+		if err := peer.Send(ctx, plan.frame); err != nil {
+			return fmt.Errorf("send frame: %w", err)
+		}
+		return nil
+	}
+	for _, part := range plan.parts {
+		if err := peer.Send(ctx, part); err != nil {
+			return fmt.Errorf("send frame part %d/%d: %w", part.PartIndex, part.PartCount, err)
+		}
+	}
+	return nil
 }
 
 func (s *Service) inputLoop(ctx context.Context, peer Peer, errs chan<- error) {
@@ -383,7 +537,7 @@ func (s *Service) handleInput(ctx context.Context, peer Peer, message protocol.M
 	if !ok {
 		return fmt.Errorf("%w: message type %T", ErrInvalidInput, message)
 	}
-	if err := protocol.ValidateMessage(message, protocol.DefaultLimits()); err != nil {
+	if err := protocol.ValidateMessage(message, s.config.Limits); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
 
@@ -415,6 +569,7 @@ func (s *Service) handleInput(ctx context.Context, peer Peer, message protocol.M
 	}
 	s.rateBurstActive = false // an accepted event ends any drop burst
 	width, height := s.width, s.height
+	nativeWidth, nativeHeight := s.nativeWidth, s.nativeHeight
 	s.rateCount++
 	s.lastInputSeq = sequence
 	s.mu.Unlock()
@@ -426,7 +581,10 @@ func (s *Service) handleInput(ctx context.Context, peer Peer, message protocol.M
 		if v.X >= width || v.Y >= height {
 			return fmt.Errorf("%w: pointer outside display", ErrInvalidInput)
 		}
-		return s.input.Move(ctx, v.X, v.Y)
+		// The client reports coordinates in the advertised (possibly
+		// downscaled) display space; map them back to native capture
+		// coordinates so a v1 client's pointer still lands where it aimed.
+		return s.input.Move(ctx, remapCoordinate(v.X, width, nativeWidth), remapCoordinate(v.Y, height, nativeHeight))
 	case protocol.PointerButton:
 		return s.input.Button(ctx, v.Button, v.Action)
 	case protocol.PointerWheel:

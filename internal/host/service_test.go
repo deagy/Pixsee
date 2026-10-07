@@ -136,6 +136,53 @@ func testConfig() Config {
 	return Config{DisplayID: 0, CaptureInterval: time.Millisecond, KeyframeInterval: time.Hour, MaxInputEventsPerSecond: 100, EnableInput: true}
 }
 
+// TestServiceValidatesInputAgainstConfiguredLimits proves finding L1: the host
+// validates an inbound input message against the service's configured Limits,
+// not protocol.DefaultLimits(). The capture is 200 wide so a pointer at x=150
+// passes the host's own display-bounds check; only the reduced MaxDimension
+// (100) makes ValidateMessage reject it. Under DefaultLimits (8192) the same
+// message is valid and would be injected.
+func TestServiceValidatesInputAgainstConfiguredLimits(t *testing.T) {
+	cfg := testConfig()
+	cfg.Limits = protocol.Limits{MaxDimension: 100}
+	in := make(chan protocol.Message, 1)
+	in <- protocol.PointerMove{Generation: 1, InputSequence: 1, X: 150, Y: 0}
+	close(in)
+	input := &fakeInput{}
+	native := damage.Image{Width: 200, Height: 200, Pixels: solidPixels(200, 200, 1)}
+	err := NewService(cfg, &fakeCapture{frames: []damage.Image{native}}, input).Run(context.Background(), &fakePeer{incoming: in})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("Run error=%v, want ErrInvalidInput", err)
+	}
+	if calls, _ := input.snapshot(); len(calls) != 0 {
+		t.Fatalf("input injected despite exceeding the configured MaxDimension: %#v", calls)
+	}
+}
+
+// TestEffectiveLimitsMirrorsProtocolBounding pins the host's normalization to
+// protocol's own bounding: zero and over-hard fields select the hard cap, and
+// valid fields pass through untouched. This keeps a feasibility error naming
+// the cap actually enforced even when Config.Limits is only partially set.
+func TestEffectiveLimitsMirrorsProtocolBounding(t *testing.T) {
+	if got := effectiveLimits(protocol.Limits{}); got != protocol.DefaultLimits() {
+		t.Fatalf("effectiveLimits(zero)=%+v, want DefaultLimits", got)
+	}
+	over := protocol.Limits{
+		MaxControlPayload: protocol.MaxControlPayloadHard + 1,
+		MaxPixelPayload:   protocol.MaxPixelPayloadHard + 1,
+		MaxRectangles:     protocol.MaxRectanglesHard + 1,
+		MaxFrameParts:     protocol.MaxFramePartsHard + 1,
+		MaxDimension:      protocol.MaxDimensionHard + 1,
+	}
+	if got := effectiveLimits(over); got != protocol.DefaultLimits() {
+		t.Fatalf("effectiveLimits(over-hard)=%+v, want DefaultLimits", got)
+	}
+	valid := protocol.Limits{MaxControlPayload: 1 << 10, MaxPixelPayload: 1 << 20, MaxRectangles: 16, MaxFrameParts: 4, MaxDimension: 100}
+	if got := effectiveLimits(valid); got != valid {
+		t.Fatalf("effectiveLimits(valid)=%+v, want %+v unchanged", got, valid)
+	}
+}
+
 func TestServiceSendsDisplayKeyframeAndNoFramesForUnchangedCapture(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
 	defer cancel()

@@ -6,9 +6,14 @@ import (
 )
 
 const (
-	Magic                 = "VDP1"
-	Version1              = uint16(1)
-	HeaderSize            = 24
+	Magic      = "VDP1"
+	Version1   = uint16(1)
+	Version2   = uint16(2)
+	HeaderSize = 24
+	// MaxFramePartsHard bounds the number of FRAME_PART messages a single
+	// logical frame may be split into. A frame needing more parts is rejected
+	// rather than streamed unbounded.
+	MaxFramePartsHard     = uint16(32)
 	MaxControlPayloadHard = uint32(64 << 10)
 	MaxPixelPayloadHard   = uint32(16 << 20)
 	MaxRectanglesHard     = uint16(256)
@@ -52,17 +57,30 @@ const (
 	TypePong
 	TypeError
 	TypeClose
+	// TypeFramePart is a v2-only message carrying one part of a frame split
+	// across multiple messages. Appending it keeps every earlier type number
+	// stable; range-based validators below are widened deliberately.
+	TypeFramePart
 )
 
 func (t Type) String() string {
-	names := [...]string{"", "AUTH", "CLIENT_HELLO", "SERVER_HELLO", "DISPLAY_CONFIG", "FRAME", "KEYFRAME_REQUEST", "KEY", "POINTER_MOVE", "POINTER_BUTTON", "POINTER_WHEEL", "FOCUS_LOST", "PING", "PONG", "ERROR", "CLOSE"}
+	names := [...]string{"", "AUTH", "CLIENT_HELLO", "SERVER_HELLO", "DISPLAY_CONFIG", "FRAME", "KEYFRAME_REQUEST", "KEY", "POINTER_MOVE", "POINTER_BUTTON", "POINTER_WHEEL", "FOCUS_LOST", "PING", "PONG", "ERROR", "CLOSE", "FRAME_PART"}
 	if int(t) < len(names) && t > 0 {
 		return names[t]
 	}
 	return fmt.Sprintf("TYPE_%d", t)
 }
 
-func (t Type) valid() bool { return t >= TypeAuth && t <= TypeClose }
+func (t Type) valid() bool { return t >= TypeAuth && t <= TypeFramePart }
+
+// usesPixelPayload reports whether a message type carries rectangle pixel
+// payloads and therefore draws on the pixel (not control) payload budget.
+func usesPixelPayload(t Type) bool { return t == TypeFrame || t == TypeFramePart }
+
+// requiresVersion2 reports whether a message type is only defined by protocol
+// version 2 or later. The record envelope's version gates it: a v1-pinned
+// encoder or decoder rejects these types with ErrVersion.
+func requiresVersion2(t Type) bool { return t == TypeFramePart }
 
 type Message interface{ Type() Type }
 type Auth struct {
@@ -117,6 +135,20 @@ type Frame struct {
 }
 
 func (Frame) Type() Type { return TypeFrame }
+
+// FramePart is one ordered piece of a frame whose rectangles did not fit in a
+// single FRAME message (protocol v2). Every part repeats the frame's logical
+// header so a part is self-describing, and adds its zero-based PartIndex and
+// the PartCount of the sequence it belongs to. Rectangles are never split
+// across parts; a part's rectangle list is a subset of the frame's, in order.
+type FramePart struct {
+	Generation, FrameSequence, BaseFrameSequence uint64
+	Keyframe                                     bool
+	PartIndex, PartCount                         uint16
+	Rectangles                                   []Rectangle
+}
+
+func (FramePart) Type() Type { return TypeFramePart }
 
 type KeyframeRequest struct{ Generation uint64 }
 
@@ -214,11 +246,18 @@ func (Close) Type() Type { return TypeClose }
 type Limits struct {
 	MaxControlPayload, MaxPixelPayload uint32
 	MaxRectangles                      uint16
+	MaxFrameParts                      uint16
 	MaxDimension                       uint32
 }
 
 func DefaultLimits() Limits {
-	return Limits{MaxControlPayloadHard, MaxPixelPayloadHard, MaxRectanglesHard, MaxDimensionHard}
+	return Limits{
+		MaxControlPayload: MaxControlPayloadHard,
+		MaxPixelPayload:   MaxPixelPayloadHard,
+		MaxRectangles:     MaxRectanglesHard,
+		MaxFrameParts:     MaxFramePartsHard,
+		MaxDimension:      MaxDimensionHard,
+	}
 }
 
 func (l Limits) bounded() Limits {
@@ -230,6 +269,9 @@ func (l Limits) bounded() Limits {
 	}
 	if l.MaxRectangles == 0 || l.MaxRectangles > MaxRectanglesHard {
 		l.MaxRectangles = MaxRectanglesHard
+	}
+	if l.MaxFrameParts == 0 || l.MaxFrameParts > MaxFramePartsHard {
+		l.MaxFrameParts = MaxFramePartsHard
 	}
 	if l.MaxDimension == 0 || l.MaxDimension > MaxDimensionHard {
 		l.MaxDimension = MaxDimensionHard
@@ -276,7 +318,7 @@ func ValidateState(state State, message Message) error {
 	case StateNegotiating:
 		valid = t == TypeClientHello || t == TypeServerHello || t == TypeDisplayConfig || t == TypeError || t == TypeClose
 	case StateActive:
-		valid = t >= TypeDisplayConfig && t <= TypeClose && t != TypeAuth && t != TypeClientHello && t != TypeServerHello
+		valid = t >= TypeDisplayConfig && t <= TypeFramePart && t != TypeAuth && t != TypeClientHello && t != TypeServerHello
 	case StateClosing:
 		valid = t == TypeError || t == TypeClose
 	case StateClosed:
@@ -295,7 +337,7 @@ func ValidateDirection(role Role, flow Flow, message Message) error {
 	t := message.Type()
 	bidirectional := t == TypePing || t == TypePong || t == TypeError || t == TypeClose
 	clientOrigin := t == TypeAuth || t == TypeClientHello || t == TypeKeyframeRequest || (t >= TypeKey && t <= TypeFocusLost)
-	hostOrigin := t == TypeServerHello || t == TypeDisplayConfig || t == TypeFrame
+	hostOrigin := t == TypeServerHello || t == TypeDisplayConfig || t == TypeFrame || t == TypeFramePart
 	originClient := (role == RoleClient && flow == Outgoing) || (role == RoleHost && flow == Incoming)
 	if bidirectional || (originClient && clientOrigin) || (!originClient && hostOrigin) {
 		return nil
@@ -318,7 +360,13 @@ func NegotiateVersion(clientMin, clientMax, serverMin, serverMax uint16) (uint16
 	if min > max {
 		return 0, ErrNoCommonVersion
 	}
-	if max != Version1 {
+	// The overlap window is resolved; now reject any agreed version this
+	// implementation does not speak. v1.4.1 clamped the client max against the
+	// server max before this guard, so a v2 offer {1,2} against a deployed v1
+	// host {1,1} resolves to 1 here and negotiates down on the first handshake
+	// — no retry. The guard is what stops two v2 peers from agreeing on an
+	// unsupported higher version.
+	if max != Version1 && max != Version2 {
 		return 0, ErrVersion
 	}
 	return max, nil
