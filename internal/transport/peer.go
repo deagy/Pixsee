@@ -98,6 +98,35 @@ func (p *Peer) readTimeout() time.Duration {
 	return p.timeout
 }
 
+// SetVersionWindow widens the decoder's accepted record-envelope versions to
+// the inclusive range [min,max] for the HELLO exchange. A v2-capable peer
+// calls SetVersionWindow(protocol.Version1, protocol.Version2) before the
+// exchange; the default is v1-only, preserving v1 byte behavior. The encoder
+// is unaffected until PinVersion.
+func (p *Peer) SetVersionWindow(min, max uint16) {
+	if p == nil {
+		return
+	}
+	p.receiveMu.Lock()
+	defer p.receiveMu.Unlock()
+	p.decoder.SetVersionWindow(min, max)
+}
+
+// PinVersion pins both the encoder and the decoder to v once SERVER_HELLO
+// fixes the negotiated version. It never resets the decoder's strict
+// record-sequence counter, so continuity is enforced across the transition.
+func (p *Peer) PinVersion(v uint16) {
+	if p == nil {
+		return
+	}
+	p.sendMu.Lock()
+	p.encoder.PinVersion(v)
+	p.sendMu.Unlock()
+	p.receiveMu.Lock()
+	p.decoder.PinVersion(v)
+	p.receiveMu.Unlock()
+}
+
 func (p *Peer) Send(ctx context.Context, message protocol.Message) error {
 	if p == nil || p.conn == nil {
 		return ErrClosed

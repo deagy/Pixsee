@@ -79,6 +79,11 @@ type Config struct {
 	// matching the host's -timeout default. Steady-state deadlines are armed
 	// later by host.Service.Run from the heartbeat config (D7).
 	IOTimeout time.Duration
+	// ServerMaxVersion is the highest protocol version the host offers during
+	// HELLO negotiation. Zero selects Version1, so existing callers and tests
+	// keep the v1-only behavior; Version2 opts into the v2 capability while a
+	// v1 client still negotiates down to v1 on the first handshake.
+	ServerMaxVersion uint16
 	// Admissions carries the single-active-session policy; nil admits
 	// unconditionally.
 	Admissions *Admissions
@@ -148,7 +153,7 @@ func Accept(ctx context.Context, conn net.Conn, cfg Config) (*Established, error
 		err = ErrBusy
 		return nil, err
 	}
-	established, helloErr := acceptHello(ctx, peer)
+	established, helloErr := acceptHello(ctx, peer, cfg.ServerMaxVersion)
 	if helloErr != nil {
 		release()
 		err = helloErr
@@ -164,7 +169,13 @@ func Accept(ctx context.Context, conn net.Conn, cfg Config) (*Established, error
 // state, closing the connection; the client then times out waiting for
 // SERVER_HELLO and reconnects forever with no display ever appearing. See
 // docs/architecture.md §5 and §8.
-func acceptHello(ctx context.Context, peer *transport.Peer) (*Established, error) {
+func acceptHello(ctx context.Context, peer *transport.Peer, serverMax uint16) (*Established, error) {
+	if serverMax == 0 {
+		serverMax = protocol.Version1
+	}
+	// CLIENT_HELLO rides a v1 record envelope, so the host's decoder stays
+	// v1-only until SERVER_HELLO pins both directions to the negotiated
+	// version (including v2, which the client's later messages then use).
 	message, err := peer.Receive(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("session: hello: %w", err)
@@ -173,10 +184,13 @@ func acceptHello(ctx context.Context, peer *transport.Peer) (*Established, error
 	if !ok {
 		return nil, fmt.Errorf("session: hello: expected CLIENT_HELLO, got %T", message)
 	}
-	version, err := protocol.NegotiateVersion(hello.MinVersion, hello.MaxVersion, protocol.Version1, protocol.Version1)
+	version, err := protocol.NegotiateVersion(hello.MinVersion, hello.MaxVersion, protocol.Version1, serverMax)
 	if err != nil {
 		return nil, fmt.Errorf("session: version negotiation: %w", err)
 	}
+	// Pin before sending: SERVER_HELLO's record envelope uses the negotiated
+	// version, and the payload version equals it.
+	peer.PinVersion(version)
 	if err := peer.Send(ctx, protocol.ServerHello{Version: version}); err != nil {
 		return nil, fmt.Errorf("session: hello: %w", err)
 	}

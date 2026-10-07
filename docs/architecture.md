@@ -104,7 +104,7 @@ All protocol integers are unsigned big-endian unless explicitly signed. Each rec
 | Field | Size | Meaning |
 | --- | ---: | --- |
 | magic | 4 | ASCII `VDP1` |
-| version | 2 | protocol major, initially `1` |
+| version | 2 | record-envelope protocol major: `1`, or `2` once negotiated (see §4.3) |
 | type | 2 | closed message-type enum |
 | flags | 2 | type-specific, unknown bits rejected |
 | reserved | 2 | zero |
@@ -113,7 +113,208 @@ All protocol integers are unsigned big-endian unless explicitly signed. Each rec
 
 Readers consume the fixed header first, reject invalid magic/version/type/flags/sequence/length, and only then allocate a bounded payload. Maximum control or input payload is 64 KiB. Maximum pixel-update payload is configurable and hard-capped at 16 MiB. Display dimensions are independently capped at 8192 by 8192 and checked with overflow-safe arithmetic (hard limits in `internal/protocol/types.go`). Unknown message types, wrong-direction messages, malformed payloads, replayed/out-of-order sequence numbers, or limit violations terminate the connection with a generic protocol error when safe to send.
 
-The protocol major is negotiated by `CLIENT_HELLO` and `SERVER_HELLO`; the only MVP-supported value is 1. No common version causes clean rejection. Minor-compatible features are represented by a known capability bitset; peers reject required unknown capabilities and ignore no fields implicitly.
+The protocol major is negotiated by `CLIENT_HELLO` and `SERVER_HELLO`; this build speaks `1` and `2` (see §4.3). No common version causes clean rejection. Minor-compatible features are represented by a known capability bitset; peers reject required unknown capabilities and ignore no fields implicitly.
+
+### 4.3 Protocol version 2: multipart frames
+
+Protocol major `2` extends the v1 wire without changing any v1 message. It is
+implemented in `internal/protocol` (typed messages and framing in `types.go`
+and `codec.go`, validation in `validate.go`, packing in `frame_part.go`),
+negotiated in `internal/session` and `internal/client`, and driven by the host
+in `internal/host/service.go` with a single global switch: the negotiated
+session version. A session that negotiates v1 behaves exactly as v1 did.
+
+#### 4.3.1 Negotiation and the record envelope
+
+The record header carries a two-byte **record-envelope version** stamped by the
+encoder. Every record is written and read at the version the peer is pinned to,
+and the envelope version also gates v2-only message types: a `FRAME_PART` on a
+v1 envelope is rejected with `ErrVersion` before its payload is decoded.
+
+- `AUTH` and `CLIENT_HELLO` always ride a **v1 envelope**, because the
+  negotiated version is not yet known. `SERVER_HELLO` also rides the negotiated
+  envelope, and the host pins both directions to it *before* sending it.
+- A v2-capable decoder accepts an inclusive envelope-version window `[1,2]`
+  while awaiting the HELLO exchange (`SetVersionWindow`), then both directions
+  are **pinned** to the agreed version once `SERVER_HELLO` fixes it
+  (`PinVersion`). Pinning does not reset the strict record-sequence counter, so
+  continuity is enforced across the transition.
+
+`CLIENT_HELLO` advertises an inclusive `MinVersion`/`MaxVersion` range — `{1,2}`
+from a deploying v2 client — and `SERVER_HELLO` carries the single agreed
+version. `NegotiateVersion` intersects the two windows, resolving to the higher
+common value, and rejects an agreed version the build does not speak with
+`ErrVersion`; no overlap is `ErrNoCommonVersion`. A client may advertise a range
+extending past the versions this build speaks (forward compatibility); the
+server clamps it.
+
+- **v2 client against a v1 host:** the v1 host's window is `{1,1}`, so the
+  overlap resolves to `1` on the first handshake and the client negotiates down
+  with no retry.
+- **v2 host against a v1 client:** the client's window is `{1,1}`, so the host
+  negotiates down to `1` and runs the v1 compatibility transform (§4.3.6).
+
+#### 4.3.2 `FRAME_PART` wire format
+
+`FRAME_PART` (message type `16`, v2-only) carries a logical frame whose
+rectangles did not fit one message. Every part repeats the frame's logical
+header so a part is self-describing, then adds its zero-based `PartIndex` and
+the `PartCount` of its sequence, then a rectangle list:
+
+| Field | Size | Meaning |
+| --- | ---: | --- |
+| generation | 8 | display generation |
+| frame sequence | 8 | logical frame sequence (identical on every part) |
+| base frame sequence | 8 | delta base (0 for a keyframe) |
+| keyframe flag | 1 | `0` or `1` |
+| part index | 2 | zero-based position in the sequence |
+| part count | 2 | total parts in the sequence (always >= 2) |
+| rectangle count | 2 | rectangles carried by this part (<= 256) |
+| rectangles | ... | each: x, y, width, height (4+4+4+4), encoding (2), pixel length (4), pixels |
+
+Rectangles are **never split across parts**; a part's rectangle list is a
+subset of the frame's, in original order. A frame that fits a single message is
+sent as an ordinary `FRAME` (`SplitFrame` returns `ErrFrameFits`), so a
+`FRAME_PART` sequence always has `PartCount >= 2`.
+
+`internal/protocol.SplitFrame` packs the already-encoded whole rectangles of a
+frame greedily, in order, into as few parts as each part's marshaled payload
+stays within `MaxPixelPayload` bytes; it is deterministic, so the same frame and
+limits always yield the same partition. It returns `ErrPartTooLarge` when a
+single rectangle cannot fit a part on its own, and `ErrFrameTooLarge` when the
+frame needs more than `MaxFrameParts` parts. The host plans the packing before
+sending any `DISPLAY_CONFIG`, so a frame the configured limits cannot carry is
+refused before the client is ever told a display exists.
+
+#### 4.3.3 Sequencing: records vs logical frames
+
+Two independent counters must not be conflated:
+
+- The **record sequence** is the 8-byte header counter, incremented once per
+  encoded message in each direction. The decoder requires it to increase by
+  exactly one and rejects any gap or replay with `ErrSequence`, including across
+  the v1→v2 envelope transition (which does not reset it).
+- The **logical frame sequence** is the `frame sequence` inside a `FRAME` or
+  `FRAME_PART` payload. It identifies a logical frame: every part of one frame
+  carries the same value, and the frame is only complete once the client commits
+  it.
+
+A delta's `base frame sequence` must equal the client's last committed frame
+sequence; otherwise the client requests a keyframe rather than applying a delta
+on an unknown base.
+
+#### 4.3.4 Client reassembly, atomic commit, and reset
+
+The client (`internal/client/framebuffer.go`) reassembles at most one logical
+`FRAME_PART` sequence at a time into a single staging buffer that is always a
+distinct allocation from the visible framebuffer. Intermediate parts decode and
+blit into **staging only**; the visible pixels and committed frame sequence are
+untouched until the part whose index completes `PartCount`, when the staging
+buffer is swapped into the visible framebuffer and presented exactly once. A
+keyframe that does not cover every display pixel is rejected before commit, so
+no partial frame is ever presented.
+
+Cross-part rules are enforced across the whole sequence: a duplicate or
+out-of-order part, an inconsistent logical header, a stale generation, a
+cross-part overlap, a cumulative rectangle count over `MaxRectangles`, or an
+unexpected `FRAME`/`DISPLAY_CONFIG` mid-sequence is fatal for the session.
+
+A recoverable part-0 rejection — a delta whose base the client is missing, or
+a delta while a keyframe is required — returns `ErrKeyframeRequired`. The client
+sends exactly one `KEYFRAME_REQUEST` and **drains** the already in-flight
+trailing parts of that logical frame without decoding or blitting, so the stream
+stays framed and the host's forced keyframe is accepted without a reconnect.
+
+`Framebuffer.Reset()` drops all display state (generation, sequence, pixels,
+staging, drain state, and the keyframe requirement) at the start of every
+connection. Each host service restarts its display generation at `1` per
+connection, so retaining the previous session's generation would reject every
+new `DISPLAY_CONFIG` as stale forever; resetting also guarantees a reconnect
+can never reuse a partially reassembled frame.
+
+#### 4.3.5 Limits
+
+All bounds are hard caps in `internal/protocol/types.go`; a configured zero or
+oversized value is clamped to the cap (`Limits.bounded`, mirrored by the host's
+`effectiveLimits`).
+
+| Bound | Value | Source |
+| --- | ---: | --- |
+| control/input payload | 64 KiB | `MaxControlPayloadHard` |
+| pixel payload per message (`FRAME`/`FRAME_PART`, header excluded) | 16 MiB | `MaxPixelPayloadHard` |
+| decoded pixel bytes per rectangle (`width*height*4`) | 16 MiB | `MaxPixelPayloadHard` |
+| rectangles per message | 256 | `MaxRectanglesHard` |
+| rectangles cumulative across one logical frame | 256 | client `maxRectangles()` |
+| parts per logical frame | 32 | `MaxFramePartsHard` |
+| display dimension (each axis) | 8192 | `MaxDimensionHard` |
+| framebuffer bytes (client `DISPLAY_CONFIG`) | 256 MiB | `MaxPixelPayloadHard * 16` |
+
+The 256 MiB framebuffer bound admits the largest legal display,
+8192×8192×4 bytes.
+
+#### 4.3.6 v1 compatibility and `-max-protocol-version`
+
+`vdhost` accepts `-max-protocol-version` (`1` or `2`, default `2`; environment
+variable `VDHOST_MAX_PROTOCOL_VERSION`). Any other value is a startup error
+("must be 1 or 2"). Pinning it to `1` makes the host offer only v1 and behave
+exactly as a v1-only host.
+
+When the negotiated version is v1 — either because the host is pinned to v1 or
+because a v1 client negotiated down — the host applies a compatibility transform
+**before** damage detection and before `DISPLAY_CONFIG`, so the detector, the
+advertised dimensions, and every encoded rectangle all agree on the downscaled
+geometry (`internal/host/downscale.go`):
+
+- an oversized capture is box-downscaled by the smallest power-of-two factor
+  `2^k` whose dimensions fit the per-rectangle byte budget;
+- the downscaled dimensions are what the client is told, and it renders at that
+  size;
+- incoming pointer coordinates arrive in the advertised (downscaled) space and
+  are remapped endpoint-preservingly back to native capture coordinates
+  (`remapCoordinate`), so `0` maps to `0` and `advertised-1` maps to `native-1`.
+
+A v1 session never emits `FRAME_PART` and never keeps native resolution; a v2
+session keeps native resolution and relies on `FRAME_PART` splitting.
+
+Sample v2 host configuration:
+
+```yaml
+addr: 127.0.0.1:6511
+max-protocol-version: 2
+```
+
+#### 4.3.7 Operational and resource caveats
+
+These follow directly from the implementation; they are not performance
+guarantees.
+
+- **Large native frames cost real memory.** A v2 session keeps native
+  resolution, so an 8K capture is held on both host and client at once. A
+  7680×4320 frame is ~127 MiB; the largest legal 8192×8192 framebuffer is
+  256 MiB. The client keeps two framebuffer-sized buffers (visible + spare) —
+  up to ~512 MiB at the bound — and the host's detector keeps a full previous-
+  frame copy.
+- **`Snapshot()` copies the whole framebuffer.** Every present copies
+  `width*height*4` bytes (~33 MiB at 4K, ~127 MiB at 8K), so presentation rate
+  is bounded by that copy, not only by the wire.
+- **Delta staging uses the spare buffer.** A delta `FRAME`/`FRAME_PART`
+  sequence starts from a copy of the last committed framebuffer into the spare
+  buffer and then blits changes, so no third full-size buffer is allocated, but
+  the copy scales with display size on every delta.
+- **A large part needs sustained bandwidth.** A part may carry up to 16 MiB and
+  each write is bounded by `-timeout` (default `10s`). Delivering a full 16 MiB
+  part inside that deadline needs roughly 13.4 Mbit/s (16 MiB ÷ 10 s) of
+  *sustained* throughput before protocol and TLS overhead; a slower link times
+  the write out and closes the session. Smaller limits, smaller frames, or
+  zlib-compressed rectangles lower the required rate.
+
+The 4 KiB of headroom that `MaxRectangleBytes` reserves under the 16 MiB cap
+(`internal/damage/damage.go`) covers the fixed per-part and per-rectangle
+overhead for **one banded rectangle**: `SplitFrame` charges a part a 31-byte
+header plus 22 metadata bytes per rectangle. It is not a guarantee that
+arbitrary combinations of rectangles fit one part — `SplitFrame` packs greedily
+and may place several rectangles in a part, and the aggregate, not any single
+rectangle, is what must fit `MaxPixelPayload`.
 
 ## 5. Session lifecycle
 
@@ -121,7 +322,7 @@ The state machine is:
 
 1. `Connected`: TCP accepted; TLS handshake must finish within 10 seconds.
 2. `Authenticating`: client sends `AUTH` within 5 seconds; host admits it only if no session is active.
-3. `Negotiating`: client sends `CLIENT_HELLO`; host responds with `SERVER_HELLO` and `DISPLAY_CONFIG`.
+3. `Negotiating`: client sends `CLIENT_HELLO` (a v2 client advertises the `{1,2}` range); host responds with `SERVER_HELLO` carrying the agreed version and then `DISPLAY_CONFIG`.
 4. `Active`: host may send `FRAME`; client may send keyboard, pointer, wheel, `PING`, or `CLOSE`; host may send `PING`, `ERROR`, or `CLOSE`.
 5. `Closing`: a peer sends `CLOSE`, stops new application messages, flushes at most one bounded write, and closes TLS/TCP.
 6. `Closed`: capture, encoder, reader, writer, and input workers are canceled and joined.
@@ -156,6 +357,14 @@ A `FRAME` contains:
 - for each rectangle: `x`, `y`, `width`, `height`, encoding, encoded length, and bytes.
 
 Rectangles MUST be non-empty, within the advertised display, non-overlapping within a frame, and collectively bounded by the message and decoded-size limits. Encodings are `RAW_BGRA` and `ZLIB_BGRA`; zlib output must expand to exactly `width * height * 4` bytes and is decompressed through a hard byte limit. The encoder chooses zlib only when smaller than raw. A client applies a frame atomically only after all rectangles validate and decode. A delta is accepted only when its `base frame sequence` equals the client's last committed frame; otherwise the client requests a keyframe with `KEYFRAME_REQUEST` and does not partially render the delta.
+
+Protocol version 2 reuses the same rectangle encoding and message shapes; its
+only additional wire type is `FRAME_PART` (§4.3.2), which carries an ordered
+subset of a frame's rectangles when the frame does not fit one message. The
+client reassembles a `FRAME_PART` sequence into a staging buffer and applies it
+atomically only when the sequence completes, exactly as it applies a single
+`FRAME` (§4.3.4). The v2 per-message, per-rectangle, part-count, rectangle-count,
+and framebuffer bounds are listed in §4.3.5.
 
 ### 6.3 Changed-region strategy
 
@@ -196,7 +405,7 @@ Input is delivered over the peer's write path, bounded by the write deadline. Po
 | Message | Client to host | Host to client |
 | --- | :---: | :---: |
 | `AUTH`, `CLIENT_HELLO` | yes | no |
-| `SERVER_HELLO`, `DISPLAY_CONFIG`, `FRAME` | no | yes |
+| `SERVER_HELLO`, `DISPLAY_CONFIG`, `FRAME`, `FRAME_PART` (v2) | no | yes |
 | `KEYFRAME_REQUEST` | yes | no |
 | `KEY`, `POINTER_MOVE`, `POINTER_BUTTON`, `POINTER_WHEEL`, `FOCUS_LOST` | yes | no |
 | `PING`, `PONG`, `CLOSE`, bounded `ERROR` | yes | yes |

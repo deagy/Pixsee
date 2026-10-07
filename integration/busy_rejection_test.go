@@ -29,9 +29,9 @@ import (
 	"virtualdesktop/internal/transport"
 )
 
-// connectExpectingBusy performs a real client-side establishment against the
-// shared-acceptance host and returns the ERROR message the busy host sends
-// back before closing.
+// connectExpectingBusy authenticates against the shared-acceptance host and
+// reads the early ERROR_BUSY response. Admission is checked immediately after
+// AUTH, before CLIENT_HELLO, so sending a hello here races the host's close.
 func connectExpectingBusy(ctx context.Context, clientTLS *tls.Config, token [32]byte, addr string) (protocol.ErrorMessage, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -44,10 +44,6 @@ func connectExpectingBusy(ctx context.Context, clientTLS *tls.Config, token [32]
 	}
 	peer := transport.NewPeerConn(tlsConn, conn, protocol.RoleClient, protocol.DefaultLimits(), 5*time.Second)
 	if err := peer.AuthenticateClient(ctx, token); err != nil {
-		conn.Close()
-		return protocol.ErrorMessage{}, err
-	}
-	if err := peer.Send(ctx, protocol.ClientHello{MinVersion: protocol.Version1, MaxVersion: protocol.Version1}); err != nil {
 		conn.Close()
 		return protocol.ErrorMessage{}, err
 	}

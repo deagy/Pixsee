@@ -22,3 +22,8 @@ heartbeat-timeout: 30s
 max-input-per-sec: 500
 enable-input: true
 timeout: 10s
+# Highest protocol version the host offers during the HELLO negotiation: 1 or
+# 2 (default 2). Version 2 keeps native resolution and splits an oversized
+# frame into ordered FRAME_PART messages while remaining backward compatible
+# with v1 clients; 1 advertises v1 only.
+max-protocol-version: 2

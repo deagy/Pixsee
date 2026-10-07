@@ -169,6 +169,7 @@ func newRootCmd() *cobra.Command {
 	fs.Int("max-input-per-sec", 500, "max input events per second")
 	fs.Bool("enable-input", true, "accept client input events")
 	fs.Duration("timeout", 10*time.Second, "per-operation I/O deadline")
+	fs.Int("max-protocol-version", int(protocol.Version2), "highest protocol version the host offers (1 or 2); v2 enables multipart frame negotiation while remaining backward compatible with v1 clients")
 	fs.Bool("no-auth", false, "explicitly run without an authentication token; valid ONLY for loopback binds (127.0.0.0/8, ::1, localhost). A non-loopback -addr always requires -token.")
 
 	return cmd
@@ -188,6 +189,10 @@ type appConfig struct {
 	maxInputEvents    int
 	enableInput       bool
 	ioTimeout         time.Duration
+	// maxProtocolVersion is the highest protocol version the host offers
+	// during HELLO negotiation (from -max-protocol-version; default 2). A v1
+	// client still negotiates down to v1 on the first handshake.
+	maxProtocolVersion uint16
 
 	// ephemeralCert is set when no -ca/-key pair was supplied and the host
 	// serves a fresh self-signed certificate; certFingerprint is the SHA-256
@@ -297,6 +302,20 @@ func validateHeartbeatConfig(interval, timeout time.Duration) error {
 	return nil
 }
 
+// validateProtocolVersion bounds -max-protocol-version to the versions this
+// build speaks (v1 or v2). A value outside that set is a misconfiguration, not
+// a negotiation hint.
+func validateProtocolVersion(v int) (uint16, error) {
+	switch v {
+	case int(protocol.Version1):
+		return protocol.Version1, nil
+	case int(protocol.Version2):
+		return protocol.Version2, nil
+	default:
+		return 0, fmt.Errorf("host: max-protocol-version must be 1 or 2, got %d", v)
+	}
+}
+
 // buildConfigFromViper performs the same validation and defaulting the
 // pre-Cobra loadConfig used to perform, now reading already-resolved values
 // (flag > env > config file > default) from v.
@@ -314,15 +333,21 @@ func buildConfigFromViper(v *viper.Viper) (*appConfig, error) {
 	timeout := v.GetDuration("timeout")
 	noAuth := v.GetBool("no-auth")
 
+	maxProtocolVersion, err := validateProtocolVersion(v.GetInt("max-protocol-version"))
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &appConfig{
-		addr:              addr,
-		captureInterval:   captureRate,
-		keyframeInterval:  keyframeRate,
-		heartbeatInterval: heartbeatInterval,
-		heartbeatTimeout:  heartbeatTimeout,
-		maxInputEvents:    maxInput,
-		enableInput:       enableInput,
-		ioTimeout:         timeout,
+		addr:               addr,
+		captureInterval:    captureRate,
+		keyframeInterval:   keyframeRate,
+		heartbeatInterval:  heartbeatInterval,
+		heartbeatTimeout:   heartbeatTimeout,
+		maxInputEvents:     maxInput,
+		enableInput:        enableInput,
+		ioTimeout:          timeout,
+		maxProtocolVersion: maxProtocolVersion,
 	}
 	if err := validateHeartbeatConfig(cfg.heartbeatInterval, cfg.heartbeatTimeout); err != nil {
 		return nil, err
@@ -558,17 +583,31 @@ func serve(ctx context.Context, cfg *appConfig) error {
 	}
 }
 
+// hostLimits is the single wire-limits value vdhost applies to a session. It is
+// computed once per connection and passed to BOTH the establishment session
+// (which decodes/validates AUTH and HELLO under it) and host.Service (which
+// validates client input and packs FRAME_PARTs under it), so the two can never
+// drift onto different caps. It is a named function rather than two inline
+// protocol.DefaultLimits() calls precisely so a drift guard test can pin it
+// (finding L3).
+func hostLimits() protocol.Limits { return protocol.DefaultLimits() }
+
 // handleConnection owns one inbound connection end to end. Session
 // establishment itself (TLS accept, AUTH, busy admission, HELLO) lives in
 // internal/session and is shared verbatim with the integration harness
 // (F10/AC-9); this function is pure wiring: accept, adapters, service.
 func handleConnection(ctx context.Context, cfg *appConfig, conn net.Conn) {
+	// One limits value feeds both the establishment session and the display
+	// service (finding L3): share the same variable so the two halves of the
+	// connection frame the wire identically.
+	limits := hostLimits()
 	established, err := session.Accept(ctx, conn, session.Config{
-		Token:      cfg.token,
-		TLSConfig:  cfg.tlsConfig,
-		Limits:     protocol.DefaultLimits(),
-		IOTimeout:  cfg.ioTimeout,
-		Admissions: cfg.admissions,
+		Token:            cfg.token,
+		TLSConfig:        cfg.tlsConfig,
+		Limits:           limits,
+		IOTimeout:        cfg.ioTimeout,
+		Admissions:       cfg.admissions,
+		ServerMaxVersion: cfg.maxProtocolVersion,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "vdhost: %v\n", err)
@@ -592,6 +631,11 @@ func handleConnection(ctx context.Context, cfg *appConfig, conn net.Conn) {
 		EnableInput:             cfg.enableInput,
 		HeartbeatInterval:       cfg.heartbeatInterval,
 		HeartbeatTimeout:        cfg.heartbeatTimeout,
+		// Pass the version actually negotiated for this session, not the
+		// server maximum: a v1 client must get downscaled v1 FRAMEs while a v2
+		// client gets native-resolution FRAME_PARTs.
+		ProtocolVersion: established.Version,
+		Limits:          limits,
 	}, cfg.capture, input)
 	if err := svc.Run(ctx, established.Peer); err != nil {
 		fmt.Fprintf(os.Stderr, "vdhost: session ended: %v\n", err)

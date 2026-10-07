@@ -155,6 +155,21 @@ after the interval elapses with no client activity the host sends a
 `PING` probe, and after the timeout elapses without a `PONG` (or any
 other message) it treats the session as gone.
 
+`vdhost` accepts `-max-protocol-version` (values `1` or `2`, default `2`;
+environment variable `VDHOST_MAX_PROTOCOL_VERSION`) to set the highest
+protocol version it offers during the `CLIENT_HELLO`/`SERVER_HELLO`
+negotiation. Version 2 keeps native capture resolution and splits an
+oversized frame into ordered `FRAME_PART` messages, so a deployment can
+stream 4K/8K without downscaling, while version 1 remains fully
+supported. Compatibility is automatic in both directions: a v2 client
+facing a v1 host negotiates down to v1 on the first handshake, and a v2
+host serving a v1 client downscales the display and remaps pointer
+coordinates before it announces the display. Use `-max-protocol-version 1`
+to advertise v1 only. Note that native-resolution streaming has real
+memory and bandwidth costs — see
+[`docs/architecture.md`](docs/architecture.md) §4.3 for the wire format,
+limits, and those caveats.
+
 ## Configuration
 
 Both commands resolve every configuration value with the same four-tier
@@ -193,6 +208,7 @@ heartbeat-timeout: 30s
 max-input-per-sec: 500
 enable-input: true
 timeout: 10s
+max-protocol-version: 2
 ```
 
 Run `vdhost --help` or `vdclient --help` for the authoritative, current

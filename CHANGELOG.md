@@ -9,6 +9,71 @@ itself; releases are tagged in git).
 
 ## Unreleased
 
+### Added
+
+- **Protocol version 2 — multipart frames for native-resolution streaming.**
+  A new session protocol major (`2`) lets the host stream a capture at its
+  native resolution instead of downscaling it to fit one message. A frame whose
+  rectangles do not fit a single 16 MiB message is split by
+  `internal/protocol.SplitFrame` into an ordered sequence of `FRAME_PART`
+  messages (new message type `16`), each repeating the frame's logical header
+  (generation, frame sequence, base frame sequence, keyframe flag) plus a
+  zero-based `PartIndex`/`PartCount` and a subset of the frame's rectangles in
+  original order. Rectangles are never split across parts, packing is greedy,
+  deterministic, and bounded by `MaxFrameParts` (32).
+
+  Negotiation uses the existing `CLIENT_HELLO`/`SERVER_HELLO` exchange: a v2
+  client advertises the inclusive `{1,2}` range, the host intersects it with its
+  own window, and `SERVER_HELLO` carries the single agreed version. `AUTH` and
+  `CLIENT_HELLO` always ride a v1 record envelope; a v2-capable decoder accepts
+  `[1,2]` while awaiting `SERVER_HELLO` and both directions are pinned to the
+  negotiated version once it arrives, without resetting the strict record
+  sequence. A `FRAME_PART` on a v1 envelope is rejected before its payload is
+  decoded.
+
+  The client (`internal/client/framebuffer.go`) reassembles at most one logical
+  sequence at a time into a spare staging buffer that is distinct from the
+  visible framebuffer, and commits it atomically — swapping staging into the
+  visible pixels and presenting once — only on the part that completes the
+  sequence; intermediate parts never change committed pixels. Cross-part
+  duplicate/out-of-order parts, inconsistent headers, stale generations,
+  overlaps, and a cumulative rectangle count over 256 are fatal. A recoverable
+  delta on an unknown base requests exactly one `KEYFRAME_REQUEST` and drains
+  the already in-flight tail of that logical frame without blitting, so the
+  forced keyframe is accepted without a reconnect. `Framebuffer.Reset()` drops
+  all display state at the start of every connection (each host service restarts
+  its generation at 1), so a reconnect never reuses partially reassembled state.
+
+  Bounds (hard caps, `internal/protocol/types.go`): 64 KiB control payload,
+  16 MiB pixel payload per message, 16 MiB decoded bytes per rectangle, 256
+  rectangles per message and 256 cumulative across one logical frame, 32 parts
+  per frame, 8192 per display axis, and a 256 MiB client framebuffer.
+
+- **v1 compatibility and the `-max-protocol-version` flag.** `vdhost` gains
+  `-max-protocol-version` (values `1` or `2`, default `2`; environment variable
+  `VDHOST_MAX_PROTOCOL_VERSION`); any other value is a startup error. A v1 host
+  resolves a v2 client's offer down to v1 on the first handshake with no retry.
+  A v2 host serving a v1 client applies the compatibility transform before
+  damage detection and `DISPLAY_CONFIG`: an oversized capture is
+  power-of-two box-downscaled, the downscaled dimensions are advertised, and
+  incoming pointer coordinates are remapped endpoint-preservingly back to
+  native capture coordinates. A v1 session never emits `FRAME_PART` and never
+  keeps native resolution; a v2 session keeps native resolution and relies on
+  part splitting. See `docs/architecture.md` §4.3.
+
+  Native-resolution streaming has direct resource costs documented in
+  `docs/architecture.md` §4.3.7: large 8K frames require substantial host and
+  client memory (two framebuffer-sized client buffers, up to ~512 MiB at the
+  256 MiB bound), `Snapshot()` copies the full framebuffer on every present,
+  delta staging copies the framebuffer into the spare buffer, and a full 16 MiB
+  part under the default 10 s write timeout needs roughly 13.4 Mbit/s of
+  sustained throughput before protocol/TLS overhead. The 4 KiB banding headroom
+  under the 16 MiB cap covers the fixed overhead for one banded rectangle only,
+  not arbitrary aggregate rectangles.
+
+  Docs updated: `docs/architecture.md` (§4.3, §4.2, §5, §6.2, §8),
+  `README.md`, and `configs/vdhost.example.yaml`.
+
 ## v1.4.1 - 2026-10-06
 
 ### Fixed

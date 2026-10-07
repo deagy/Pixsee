@@ -217,9 +217,15 @@ func (s *Session) ServeConn(ctx context.Context, conn net.Conn) (result error) {
 		return err
 	}
 	s.notify(StateNegotiating, nil)
-	if err := peer.Send(ctx, protocol.ClientHello{MinVersion: protocol.Version1, MaxVersion: protocol.Version1}); err != nil {
+	// Advertise v2 while staying backward compatible: AUTH and CLIENT_HELLO
+	// ride a v1 record envelope, and a deployed v1 host clamps the offer down
+	// to v1 during the first handshake (no retry).
+	if err := peer.Send(ctx, protocol.ClientHello{MinVersion: protocol.Version1, MaxVersion: protocol.Version2}); err != nil {
 		return err
 	}
+	// Accept either record-envelope version until SERVER_HELLO fixes the
+	// negotiation, then pin both directions to the negotiated version.
+	peer.SetVersionWindow(protocol.Version1, protocol.Version2)
 	message, err := peer.Receive(ctx)
 	if err != nil {
 		return err
@@ -228,9 +234,11 @@ func (s *Session) ServeConn(ctx context.Context, conn net.Conn) (result error) {
 	if !ok {
 		return fmt.Errorf("client: expected SERVER_HELLO, got %T", message)
 	}
-	if _, err := protocol.NegotiateVersion(protocol.Version1, protocol.Version1, hello.Version, hello.Version); err != nil {
+	negotiated, err := protocol.NegotiateVersion(protocol.Version1, protocol.Version2, hello.Version, hello.Version)
+	if err != nil {
 		return err
 	}
+	peer.PinVersion(negotiated)
 	message, err = peer.Receive(ctx)
 	if err != nil {
 		return err
@@ -272,7 +280,7 @@ func (s *Session) ServeConn(ctx context.Context, conn net.Conn) (result error) {
 		case protocol.Frame:
 			if err := s.framebuffer.Apply(value); err != nil {
 				if errors.Is(err, ErrKeyframeRequired) {
-					if sendErr := peer.Send(ctx, protocol.KeyframeRequest{Generation: s.framebuffer.Snapshot().Generation}); sendErr != nil {
+					if sendErr := peer.Send(ctx, protocol.KeyframeRequest{Generation: s.framebuffer.Generation()}); sendErr != nil {
 						return sendErr
 					}
 					continue
@@ -280,6 +288,27 @@ func (s *Session) ServeConn(ctx context.Context, conn net.Conn) (result error) {
 				return err
 			}
 			if s.renderer != nil {
+				s.renderer.Present(s.framebuffer.Snapshot())
+			}
+		case protocol.FramePart:
+			// v2 only: the decoder's negotiated-version gate rejects a
+			// FRAME_PART on a v1 envelope before it reaches here. Present
+			// exactly once, only when the logical frame commits; intermediate
+			// parts leave the committed pixels and sequence untouched. A
+			// recoverable part-0 rejection sends one KEYFRAME_REQUEST and the
+			// framebuffer drains the rest of that logical frame, so the
+			// host's forced keyframe is accepted without a reconnect.
+			committed, err := s.framebuffer.ApplyPart(value)
+			if err != nil {
+				if errors.Is(err, ErrKeyframeRequired) {
+					if sendErr := peer.Send(ctx, protocol.KeyframeRequest{Generation: s.framebuffer.Generation()}); sendErr != nil {
+						return sendErr
+					}
+					continue
+				}
+				return err
+			}
+			if committed && s.renderer != nil {
 				s.renderer.Present(s.framebuffer.Snapshot())
 			}
 		case protocol.Ping:
