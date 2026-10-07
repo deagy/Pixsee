@@ -22,3 +22,27 @@ func (l *loggingObserver) ConnectionState(state client.ConnectionState, err erro
 func (l *loggingObserver) log(format string, args ...any) {
 	fmt.Printf("%s %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
+
+// connectionStateText renders a connection state for the operator-facing log
+// lines above. It is defined here (untagged) so both the headless and the
+// "fyne" GUI builds of the client share one definition.
+func connectionStateText(state client.ConnectionState) string {
+	switch state {
+	case client.StateConnecting:
+		return "Connecting…"
+	case client.StateAuthenticating:
+		return "Authenticating…"
+	case client.StateNegotiating:
+		return "Negotiating…"
+	case client.StateConnected:
+		return "Connected"
+	case client.StateReconnecting:
+		return "Reconnecting…"
+	case client.StateClosed:
+		return "Closed"
+	case client.StateError:
+		return "Connection error"
+	default:
+		return "Disconnected"
+	}
+}

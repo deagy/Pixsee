@@ -8,7 +8,7 @@
 
 DIST_DIR := dist
 
-.PHONY: build build-all checksums test vet clean docs-check
+.PHONY: build build-all build-gui-windows checksums test vet clean docs-check
 
 build: ## Build all binaries for the host OS/arch (no cross-compilation)
 	@mkdir -p $(DIST_DIR)
@@ -28,6 +28,9 @@ build: ## Build all binaries for the host OS/arch (no cross-compilation)
 
 build-all: ## Cross-compile all binaries for every supported OS/arch (release build)
 	./scripts/build.sh
+
+build-gui-windows: ## Build the GUI-enabled Windows/amd64 client (Fyne, CGO, windowsgui, static; needs gcc + objdump)
+	@./scripts/build-gui-windows.sh
 
 checksums: ## Regenerate SHA256SUMS for dist/ artifacts
 	cd $(DIST_DIR) && sha256sum -- * > SHA256SUMS

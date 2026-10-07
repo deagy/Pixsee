@@ -23,7 +23,10 @@ Pixsee supports six OS/arch pairs: Linux amd64, Linux arm64, Windows amd64, Wind
 - **Host and client:** available on Linux, Windows, and macOS (amd64 and arm64).
 - **Capture:** the cross-platform `github.com/kbinani/screenshot` library on all three platforms.
 - **Input adapters (per platform):** Linux X11 (`github.com/jezek/xgb`), Windows `SendInput`, macOS `CoreGraphics`.
-- **Client renderer:** Fyne (`fyne.io/fyne/v2`).
+- **Client renderer:** Fyne (`fyne.io/fyne/v2`), compiled only under the
+  `fyne` build tag. The default release-matrix client is a headless build
+  (`CGO_ENABLED=0`) that renders no window; the windowed client is a separate
+  Windows/amd64 artifact (see §2.3).
 - **Go:** pinned in `go.mod`.
 
 ### 2.2 MVP baseline (historical)
@@ -33,6 +36,37 @@ The first usable release targeted Linux amd64 with one local X11 desktop and one
 Wayland, mobile, browser clients, headless virtual displays, and multiple simultaneous displays remain out of scope. Linux arm64 was added after CI and the native capture/input dependencies were verified there; it is not implied by pure-Go protocol portability.
 
 > **Note:** the MVP baseline above is historical. The current implementation extends it to Windows and macOS; do not read §2.2 as the supported-platform contract — use §2.1.
+
+### 2.3 GUI client build (Windows amd64)
+
+Every artifact in §2.1 is built headless: `scripts/build.sh` compiles the whole
+matrix with `CGO_ENABLED=0`, which excludes the Fyne renderer host, so
+`pixsee_client_*` renders no window, keeps its console, and is intended for CI,
+server, and diagnostic use. The windowed client is a separate, optional
+artifact built by enabling the `fyne` build tag with CGO:
+
+- Artifact: `pixsee_client_gui_windows_amd64.exe`.
+- Build: `make build-gui-windows` (or `./scripts/build-gui-windows.sh`), which
+  runs `CGO_ENABLED=1 go build -tags fyne ./cmd/vdclient/`.
+- Subsystem: linked with `-H=windowsgui`, so the exe uses the Windows GUI
+  subsystem and double-clicking it opens the Fyne window with no extra console
+  window. The Fyne status label surfaces connection state and errors; the
+  headless client keeps its console output for diagnostics.
+- Runtime DLLs: linked with `-extldflags=-static` to statically link the MinGW
+  runtime. A post-build `objdump`-based import-table gate (with a raw DLL-name
+  scan as a backstop) fails the build if the exe still imports
+  `libwinpthread-1.dll`, `libgcc_s_seh-1.dll`, or `libstdc++-6.dll`, before the
+  artifact is checksummed or uploaded.
+- Toolchain: the Go toolchain plus a C compiler (MinGW-w64 `gcc`) and
+  `objdump` on `PATH`. Fyne's Windows driver is cgo-backed and the gate
+  inspects the PE import table, so the `CGO_ENABLED=0` matrix cannot produce
+  this artifact; it is built on a native Windows runner in CI. That native job
+  is the first real build of this artifact.
+- Distribution: uploaded as a downloadable GitHub Actions artifact; it is not
+  published or released automatically.
+
+The headless matrix, its artifact names, and its default behavior are
+unchanged.
 
 ## 3. System shape and trust boundary
 

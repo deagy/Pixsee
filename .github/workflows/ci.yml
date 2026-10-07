@@ -113,3 +113,41 @@ jobs:
         with:
           go-version: '1.25'
       - run: ./scripts/build.sh
+
+  # The GUI client is a separate artifact from the headless matrix above: it
+  # enables the "fyne" build tag with CGO, so Fyne's cgo-backed Windows driver
+  # is linked in. That cannot be cross-compiled by the CGO_ENABLED=0 build job,
+  # so it runs on a native Windows runner and uploads the binary as a
+  # downloadable artifact (no publish/release step).
+  gui-windows:
+    name: GUI client (Windows amd64, Fyne, CGO)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      # Fyne needs a C compiler for cgo, and the post-build import-table gate
+      # needs objdump. windows-latest documents both MinGW-w64 gcc and GNU
+      # binutils on PATH; verify them here (same bash shell as the build step,
+      # so this checks the PATH the build actually sees) and fail clearly if
+      # either is missing rather than falling back to an installer whose PATH
+      # changes may not propagate to later steps.
+      - name: verify C toolchain (gcc + objdump) for CGO
+        shell: bash
+        run: |
+          gcc --version
+          objdump --version
+      - name: build GUI client
+        shell: bash
+        env:
+          CGO_ENABLED: '1'
+        run: ./scripts/build-gui-windows.sh
+      - name: upload GUI client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pixsee_client_gui_windows_amd64
+          path: |
+            dist/pixsee_client_gui_windows_amd64.exe
+            dist/SHA256SUMS
+          if-no-files-found: error

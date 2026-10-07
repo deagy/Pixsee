@@ -9,6 +9,25 @@ itself; releases are tagged in git).
 
 ## Unreleased
 
+### Added
+
+- **GUI-enabled Windows client artifact.** A new, distinct windowed client,
+  `pixsee_client_gui_windows_amd64.exe`, is built with the `fyne` build tag
+  and `CGO_ENABLED=1` via `make build-gui-windows` /
+  `scripts/build-gui-windows.sh`. It is linked as a Windows GUI-subsystem
+  executable (`-H=windowsgui`, so double-clicking it opens the Fyne window with
+  no extra console) with the MinGW runtime statically linked
+  (`-extldflags=-static`), and the build runs a post-build import-table gate
+  that fails if the artifact still imports `libwinpthread-1.dll`,
+  `libgcc_s_seh-1.dll`, or `libstdc++-6.dll`. The standard cross-platform matrix (`scripts/build.sh`) is
+  unchanged and remains headless (`CGO_ENABLED=0`, no window, console
+  diagnostics); the GUI artifact is produced only for Windows/amd64, needs a C
+  compiler (MinGW-w64 `gcc`) and `objdump` on `PATH`, and is uploaded as a
+  downloadable GitHub Actions artifact from a native `windows-latest` runner
+  rather than published or released. That native CI job is the first real build
+  of this artifact; it has not been built or run here. See
+  `docs/architecture.md` §2.3.
+
 ### Changed
 
 - **Input rate overrun degrades instead of disconnecting** (F7 / AC-10, owner
@@ -53,6 +72,17 @@ itself; releases are tagged in git).
 
 ### Fixed
 
+- **`fyne`-tagged client build was broken.** The headless renderer host
+  (`cmd/vdclient/renderer_host.go`) lacked a `//go:build !fyne` constraint, so
+  enabling the `fyne` tag compiled both renderer hosts and failed with
+  duplicate `rendererHost`/`newRendererHost` declarations; the shared
+  `connectionStateText` helper was also defined only in the headless file,
+  leaving the tagged build with an undefined symbol. The headless host is now
+  excluded under `fyne`, and the helper is defined once in the untagged
+  `observer.go`. The headless build compiles and is covered by the existing
+  build/test matrix; the `fyne`-tagged GUI build has not been built on this
+  platform, so the new native Windows CI job (`gui-windows`) is its first real
+  build evidence. No runtime behavior changed.
 - **Windows ARM64 config parsing crash, second round.** The v1.3.1 fix
   only handled UTF-16/BOM files, but `pixsee_host_windows_arm64.exe`
   from v1.3.1 still failed on Windows 11 ARM64 with

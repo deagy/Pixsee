@@ -65,6 +65,40 @@ Artifacts land in `dist/`, built with `CGO_ENABLED=0`. `make checksums`
 (or the build script itself) writes a `dist/SHA256SUMS` file alongside
 them. `make clean` removes `dist/`.
 
+### GUI client (Windows amd64)
+
+The artifacts in the matrix above are **headless**: they are built with
+`CGO_ENABLED=0`, so `vdclient` renders no window and keeps its console for
+CI, server, and diagnostic use. The windowed client is a separate, optional
+artifact, built only for Windows amd64 by enabling the `fyne` build tag
+with CGO:
+
+```sh
+make build-gui-windows
+# or
+./scripts/build-gui-windows.sh
+```
+
+This writes `dist/pixsee_client_gui_windows_amd64.exe` and refreshes
+`dist/SHA256SUMS`. The artifact is linked as a Windows GUI-subsystem
+executable (`-H=windowsgui`), so double-clicking it opens the Fyne window
+with **no extra console window** — the Fyne status label shows the
+connection state and any error. The MinGW runtime is statically linked
+(`-extldflags=-static`), and the build runs a post-build import-table gate
+that fails if the exe still imports `libwinpthread-1.dll`,
+`libgcc_s_seh-1.dll`, or `libstdc++-6.dll`, so no MinGW runtime DLLs need to
+ship alongside it.
+
+The build needs `gcc` (MinGW-w64, e.g. the `mingw-w64-x86_64-gcc` package
+from MSYS2) and `objdump` on `PATH` in addition to Go, because Fyne's
+Windows driver is cgo-backed and the gate inspects the PE import table — the
+`CGO_ENABLED=0` matrix cannot produce this artifact. Continuous integration
+builds it on a native `windows-latest` runner and uploads it as a
+downloadable GitHub Actions artifact (`pixsee_client_gui_windows_amd64`); it
+is not published or released automatically. That native job is the first
+real build of this artifact. The headless artifacts, their names, the
+console diagnostics they keep, and the default build behavior are unchanged.
+
 ## Running
 
 ```sh
@@ -222,7 +256,9 @@ Continuous integration runs the same gates on every push and pull request in
 check, `go vet`, unit tests split so the RSA-2048 client handshake tests do not
 hold up the rest of the suite, a `-race` gate on the fast packages, the
 integration suite, a fixed-budget protocol fuzz smoke run, and a
-cross-compile of every release binary.
+cross-compile of every release binary. A separate `windows-latest` job builds
+the GUI client (see [GUI client](#gui-client-windows-amd64)) and uploads it as
+a downloadable artifact.
 
 Unit tests use [testify](https://github.com/stretchr/testify) (`assert`
 and `require`) for assertions, and [mockery](https://github.com/vektra/mockery)-generated

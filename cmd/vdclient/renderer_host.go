@@ -1,3 +1,5 @@
+//go:build !fyne
+
 package main
 
 import (
@@ -49,25 +51,4 @@ func (h *rendererHost) Quit() {
 	h.closeOnce.Do(func() {
 		close(h.closed)
 	})
-}
-
-func connectionStateText(state client.ConnectionState) string {
-	switch state {
-	case client.StateConnecting:
-		return "Connecting…"
-	case client.StateAuthenticating:
-		return "Authenticating…"
-	case client.StateNegotiating:
-		return "Negotiating…"
-	case client.StateConnected:
-		return "Connected"
-	case client.StateReconnecting:
-		return "Reconnecting…"
-	case client.StateClosed:
-		return "Closed"
-	case client.StateError:
-		return "Connection error"
-	default:
-		return "Disconnected"
-	}
 }
