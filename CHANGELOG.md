@@ -9,6 +9,8 @@ itself; releases are tagged in git).
 
 ## Unreleased
 
+## v1.5.0 - 2026-10-07
+
 ### Added
 
 - **Protocol version 2 — multipart frames for native-resolution streaming.**
