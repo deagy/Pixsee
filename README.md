@@ -94,10 +94,10 @@ from MSYS2) and `objdump` on `PATH` in addition to Go, because Fyne's
 Windows driver is cgo-backed and the gate inspects the PE import table — the
 `CGO_ENABLED=0` matrix cannot produce this artifact. Continuous integration
 builds it on a native `windows-latest` runner and uploads it as a
-downloadable GitHub Actions artifact (`pixsee_client_gui_windows_amd64`); it
-is not published or released automatically. That native job is the first
-real build of this artifact. The headless artifacts, their names, the
-console diagnostics they keep, and the default build behavior are unchanged.
+downloadable GitHub Actions artifact (`pixsee_client_gui_windows_amd64`).
+The workflow does not create or publish a release on its own; a manual tagged
+release can attach the uploaded artifact. The headless artifacts, their names,
+the console diagnostics they keep, and the default build behavior are unchanged.
 
 ## Running
 

@@ -9,6 +9,8 @@ itself; releases are tagged in git).
 
 ## Unreleased
 
+## v1.4.0 - 2026-10-06
+
 ### Added
 
 - **GUI-enabled Windows client artifact.** A new, distinct windowed client,
@@ -24,9 +26,12 @@ itself; releases are tagged in git).
   diagnostics); the GUI artifact is produced only for Windows/amd64, needs a C
   compiler (MinGW-w64 `gcc`) and `objdump` on `PATH`, and is uploaded as a
   downloadable GitHub Actions artifact from a native `windows-latest` runner
-  rather than published or released. That native CI job is the first real build
-  of this artifact; it has not been built or run here. See
-  `docs/architecture.md` §2.3.
+  rather than published or released. That native `windows-latest` job
+  (`gui-windows`) built the artifact and uploaded it successfully on CI run
+  [37566223183](https://github.com/deagy/pixsee/actions/runs/37566223183), so
+  the Fyne+CGO build path is verified end to end; the workflow itself does not
+  create or publish a GitHub release, and a manual tagged release can attach
+  the uploaded artifact. See `docs/architecture.md` §2.3.
 
 ### Changed
 
@@ -80,9 +85,14 @@ itself; releases are tagged in git).
   leaving the tagged build with an undefined symbol. The headless host is now
   excluded under `fyne`, and the helper is defined once in the untagged
   `observer.go`. The headless build compiles and is covered by the existing
-  build/test matrix; the `fyne`-tagged GUI build has not been built on this
-  platform, so the new native Windows CI job (`gui-windows`) is its first real
-  build evidence. No runtime behavior changed.
+  build/test matrix; the `fyne`-tagged GUI build compiles and is built
+  successfully by the native `windows-latest` CI job (`gui-windows`) on run
+  37566223183. No runtime behavior changed.
+
+## v1.3.2 - 2026-09-18
+
+### Fixed
+
 - **Windows ARM64 config parsing crash, second round.** The v1.3.1 fix
   only handled UTF-16/BOM files, but `pixsee_host_windows_arm64.exe`
   from v1.3.1 still failed on Windows 11 ARM64 with

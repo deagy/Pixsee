@@ -60,10 +60,10 @@ artifact built by enabling the `fyne` build tag with CGO:
 - Toolchain: the Go toolchain plus a C compiler (MinGW-w64 `gcc`) and
   `objdump` on `PATH`. Fyne's Windows driver is cgo-backed and the gate
   inspects the PE import table, so the `CGO_ENABLED=0` matrix cannot produce
-  this artifact; it is built on a native Windows runner in CI. That native job
-  is the first real build of this artifact.
-- Distribution: uploaded as a downloadable GitHub Actions artifact; it is not
-  published or released automatically.
+  this artifact; it is built on a native Windows runner in CI.
+- Distribution: CI uploads the built executable as a downloadable GitHub
+  Actions artifact. The workflow does not create or publish a release on its
+  own; a manual tagged release can attach the uploaded artifact.
 
 The headless matrix, its artifact names, and its default behavior are
 unchanged.
