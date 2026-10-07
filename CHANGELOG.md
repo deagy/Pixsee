@@ -9,6 +9,17 @@ itself; releases are tagged in git).
 
 ## Unreleased
 
+## v1.4.1 - 2026-10-06
+
+### Fixed
+
+- **Fyne GUI client failed to open its window.** The Fyne event loop now runs
+  on the process main goroutine, as required by its GLFW driver; the network
+  session runs in the background. Closing the window, cancelling the session,
+  or receiving a session error now shuts down both sides cleanly. Added
+  lifecycle tests for window-close, cancellation, session completion, and
+  simultaneous shutdown. The headless client's console behavior is unchanged.
+
 ## v1.4.0 - 2026-10-06
 
 ### Added

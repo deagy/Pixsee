@@ -25,6 +25,7 @@ type FyneRenderer struct {
 	input  *InputState
 	mu     sync.Mutex
 	closed bool
+	exited bool
 }
 
 func NewFyneRenderer(title string, input *InputState) *FyneRenderer {
@@ -85,7 +86,24 @@ func connectionStateText(state ConnectionState) string {
 		return "Disconnected"
 	}
 }
-func (r *FyneRenderer) Run() { r.window.Show(); r.window.Canvas().Focus(r.view); r.app.Run() }
+func (r *FyneRenderer) Run() {
+	r.window.Show()
+	r.window.Canvas().Focus(r.view)
+	r.app.Run()
+	// app.Run has returned, so the Fyne driver has drained and closed its
+	// event queue. Record that before returning to the caller (runGUILifecycle's
+	// hostRun) so a late Quit does not try to schedule fyne.Do onto that queue.
+	r.mu.Lock()
+	r.exited = true
+	r.mu.Unlock()
+}
+
+// Quit asks the UI to close. It is safe to call from any goroutine and is
+// idempotent: the first call releases held input and requests the window quit,
+// and every later call is a no-op.
+//
+// Quit deliberately releases input before quitting the window so key and button
+// releases reach the peer while the session is still alive.
 func (r *FyneRenderer) Quit() {
 	r.mu.Lock()
 	if r.closed {
@@ -93,8 +111,21 @@ func (r *FyneRenderer) Quit() {
 		return
 	}
 	r.closed = true
+	exited := r.exited
 	r.mu.Unlock()
+
 	_ = r.input.Disconnect()
+
+	if exited {
+		// The UI event loop has already returned. Fyne's glfw driver sets its
+		// internal "drained" flag and then closes funcQueue as it shuts down, so
+		// a late fyne.Do runs the callback inline on this goroutine (an
+		// off-UI-thread mutation of Fyne objects), and in the narrow window
+		// where the queue closes between the drained check and the enqueue it
+		// can panic with "send on closed channel". The window is already gone,
+		// so there is nothing left to quit.
+		return
+	}
 	fyne.Do(func() { r.window.SetCloseIntercept(nil); r.app.Quit() })
 }
 

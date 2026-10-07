@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"sync"
 
 	"virtualdesktop/internal/client"
@@ -40,4 +41,12 @@ func (h *rendererHost) Run() {
 
 func (h *rendererHost) Quit() {
 	h.fyne.Quit()
+}
+
+// runHost runs the Fyne event loop on the calling (main) goroutine, as Fyne's
+// GLFW-backed driver requires, with the session on a background goroutine via
+// runGUILifecycle. Closing the window cancels the session; cancelling the
+// context or the session ending quits the window.
+func runHost(ctx context.Context, host *rendererHost, session *client.Session, observer *loggingObserver) error {
+	return finishSession(runGUILifecycle(ctx, host.Run, host.Quit, session.Run), observer)
 }

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -51,4 +52,14 @@ func (h *rendererHost) Quit() {
 	h.closeOnce.Do(func() {
 		close(h.closed)
 	})
+}
+
+// runHost keeps the headless arrangement: the dependency-free renderer host
+// blocks on a background goroutine (there is no window that needs the main
+// goroutine), while the session drives the process from the main goroutine.
+// When the session returns, host.Quit releases the host goroutine.
+func runHost(ctx context.Context, host *rendererHost, session *client.Session, observer *loggingObserver) error {
+	go host.Run()
+	defer host.Quit()
+	return finishSession(session.Run(ctx), observer)
 }

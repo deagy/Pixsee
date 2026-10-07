@@ -293,8 +293,6 @@ func run(cfg *appConfig) error {
 	// and the session (which delivers it to the host).
 	input := client.NewInputState(nil)
 	host := newRendererHost(cfg.title(), input)
-	go host.Run()
-	defer host.Quit()
 
 	observer := &loggingObserver{}
 	if cfg.Dial == nil {
@@ -314,12 +312,5 @@ func run(cfg *appConfig) error {
 	}
 
 	observer.log("connecting to %s", cfg.addr)
-	if err := session.Run(ctx); err != nil {
-		if errors.Is(err, context.Canceled) {
-			observer.log("shutting down")
-			return nil
-		}
-		return err
-	}
-	return nil
+	return runHost(ctx, host, session, observer)
 }
