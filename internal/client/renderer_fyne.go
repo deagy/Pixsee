@@ -3,7 +3,9 @@
 package client
 
 import (
+	"fmt"
 	"image"
+	"os"
 	"sync"
 
 	"fyne.io/fyne/v2"
@@ -18,24 +20,33 @@ import (
 // FyneRenderer presents immutable snapshots on Fyne's UI thread and captures
 // only the protocol-approved keyboard and pointer interactions.
 type FyneRenderer struct {
-	app    fyne.App
-	window fyne.Window
-	view   *desktopView
-	status *widget.Label
-	input  *InputState
-	mu     sync.Mutex
-	closed bool
-	exited bool
+	app         fyne.App
+	window      fyne.Window
+	view        *desktopView
+	status      *widget.Label
+	input       *InputState
+	mu          sync.Mutex
+	closed      bool
+	exited      bool
+	debugRender bool
+	title       string
 }
 
 func NewFyneRenderer(title string, input *InputState) *FyneRenderer {
-	a := app.NewWithID("com.virtualdesktop.client")
+	return newFyneRenderer(app.NewWithID("com.virtualdesktop.client"), title, input)
+}
+
+func newFyneRenderer(a fyne.App, title string, input *InputState) *FyneRenderer {
 	w := a.NewWindow(title)
 	status := widget.NewLabel("Disconnected")
 	view := newDesktopView(input)
 	w.SetContent(container.NewBorder(status, nil, nil, nil, view))
 	w.Resize(fyne.NewSize(1280, 720))
-	r := &FyneRenderer{app: a, window: w, view: view, status: status, input: input}
+	r := &FyneRenderer{
+		app: a, window: w, view: view, status: status, input: input,
+		debugRender: os.Getenv("PIXSEE_DEBUG_RENDER") == "1",
+		title:       title,
+	}
 	w.SetCloseIntercept(func() { r.Quit() })
 	a.Lifecycle().SetOnExitedForeground(func() { _ = input.SetFocused(false) })
 	if keys, ok := w.Canvas().(desktop.Canvas); ok {
@@ -55,8 +66,23 @@ func (r *FyneRenderer) Present(frame Snapshot) {
 		}
 		r.view.image.Image = &image.NRGBA{Pix: pixels, Stride: int(frame.Width) * 4, Rect: image.Rect(0, 0, int(frame.Width), int(frame.Height))}
 		r.view.image.Refresh()
+		if r.debugRender {
+			r.updateDebugTitle(frame)
+		}
 	})
 }
+func (r *FyneRenderer) updateDebugTitle(frame Snapshot) {
+	c := r.window.Canvas()
+	r.window.SetTitle(formatDebugOverlay(r.title, frame,
+		r.window.Content().Size(), c.Size(), r.view.Size(), r.view.image.Size(), c.Scale()))
+}
+
+func formatDebugOverlay(title string, frame Snapshot, win, canvas, view, img fyne.Size, scale float32) string {
+	return fmt.Sprintf("%s | frame:%dx%d scale:%.2f content:%.0fx%.0f canvas:%.0fx%.0f view:%.0fx%.0f img:%.0fx%.0f",
+		title, frame.Width, frame.Height, scale,
+		win.Width, win.Height, canvas.Width, canvas.Height, view.Width, view.Height, img.Width, img.Height)
+}
+
 func (r *FyneRenderer) ConnectionState(state ConnectionState, err error) {
 	fyne.Do(func() {
 		if err != nil {

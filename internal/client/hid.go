@@ -36,7 +36,8 @@ func HIDUsage(name string) (uint16, bool) {
 // Kept as a variable to make key mapping independent from native toolkit APIs.
 var namedHIDUsages = map[string]uint16{
 	"Enter": 0x28, "Return": 0x28, "Escape": 0x29, "Backspace": 0x2a,
-	"Tab": 0x2b, "Space": 0x2c, "Minus": 0x2d, "Equal": 0x2e,
+	"BackSpace": 0x2a,
+	"Tab":       0x2b, "Space": 0x2c, "Minus": 0x2d, "Equal": 0x2e,
 	"LeftBracket": 0x2f, "RightBracket": 0x30, "Backslash": 0x31,
 	"Semicolon": 0x33, "Apostrophe": 0x34, "Grave": 0x35,
 	"Comma": 0x36, "Period": 0x37, "Slash": 0x38, "CapsLock": 0x39,
