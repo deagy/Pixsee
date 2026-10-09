@@ -9,6 +9,17 @@ itself; releases are tagged in git).
 
 ## Unreleased
 
+### Added
+
+- **Opt-in Fyne render diagnostics.** Set `PIXSEE_DEBUG_RENDER=1` to show the
+  remote frame dimensions and Fyne content, canvas, view, image, and scale
+  measurements in the GUI window title while diagnosing native rendering.
+
+### Fixed
+
+- **Backspace key delivery.** Recognize Fyne's `BackSpace` key name so the
+  client sends the expected HID Backspace usage to the host.
+
 ## v1.5.0 - 2026-10-07
 
 ### Added
