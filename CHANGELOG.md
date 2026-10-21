@@ -7,7 +7,7 @@ adapted for this project's protocol-version-based identification (see
 `docs/architecture.md` — there is no semantic-version string in the code
 itself; releases are tagged in git).
 
-## Unreleased
+## v1.5.1 - 2026-10-21
 
 ### Added
 
