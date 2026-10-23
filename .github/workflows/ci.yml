@@ -62,16 +62,20 @@ jobs:
       - run: go test -race ./internal/protocol/... ./internal/transport/... ./internal/damage/... ./internal/host/... ./internal/cliconfig/... ./cmd/vdhost/...
 
   test-client:
-    name: unit tests (client)
+    name: unit tests (client, -race)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
-      # The client package includes the RSA-2048 handshake tests; run it on its
-      # own so a slow client package does not stall the rest of the gate.
-      - run: go test ./internal/client/... ./cmd/vdclient/...
+      # The client package includes the RSA-2048 handshake tests, which dominate
+      # runtime; running them under -race here is slower but closes the last gap
+      # in the race gate (session/data-race correctness on the crypto path).
+      # TODO(R4 follow-up): switch the handshake fixtures from RSA-2048 to the
+      # production ECDSA P-256 key type (now covered by TestEcdsaP256HandshakeAndAuth)
+      # to cut this job's runtime while keeping race coverage.
+      - run: go test -race ./internal/client/... ./cmd/vdclient/...
 
   integration:
     name: integration
